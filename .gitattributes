@@ -1,0 +1,17 @@
+# Keep line endings identical for contributors on Windows, macOS and Linux:
+# text files are stored with LF in the repository whatever the contributor's OS.
+* text=auto eol=lf
+
+# Windows-only scripts need CRLF to run correctly.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Never touch binary images or VM disk images.
+*.png  binary
+*.jpg  binary
+*.gif  binary
+*.ico  binary
+*.ova  binary
+*.iso  binary
+*.vmdk binary

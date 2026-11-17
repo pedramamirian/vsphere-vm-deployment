@@ -1,0 +1,79 @@
+# Privileges the tool uses, grouped by the inventory object they are checked on.
+# `vmdeploy doctor` verifies every ID exists in your vCenter's privilege list and that your account holds it.
+# docs/least-privilege.md explains how to build a custom role from this list.
+
+# Only for `vmdeploy access setup / remove` (run by an administrator). Never part of the deploy role.
+access_admin:
+  - Authorization.ModifyRoles
+  - Authorization.ModifyPermissions
+  - Host.Local.ManageUserGroups            # standalone ESXi only: create / delete the local deploy user
+
+# Only when `access setup` creates a folder for the account (checked then, never part of the deploy role).
+access_admin_folder:   # on the datacenter's VM folder
+  - Folder.Create
+  - Folder.Delete
+# Only for `vmdeploy access audit` (read-only report; checked never, used if available).
+access_audit:
+  - Datastore.Browse                       # look for VM files on datastores that no VM uses
+  - Sessions.TerminateSession              # vCenter only lists sessions to accounts holding this
+
+# Only for `vmdeploy keyprovider backup` (run by an administrator). Never part of the deploy role.
+keyprovider_admin:     # vCenter: list Native Key Providers and export (back up) one
+  - Cryptographer.ManageKeyServers
+
+access_admin_label:    # at the top of the inventory: the `vmdeploy` custom attribute that labels the folder
+  - Global.ManageCustomFields
+  - Global.SetCustomField
+
+read:  # any object; included in every role
+  - System.Anonymous
+  - System.View
+  - System.Read
+
+folder:  # target VM folder
+  - VirtualMachine.Inventory.Create
+  - VirtualMachine.Inventory.Delete        # cleanup after a failed deployment, `vmdeploy destroy`
+  - VApp.Import                            # OVA / OVF deployment
+
+resource_pool:  # target cluster / resource pool / host
+  - Resource.AssignVMToPool
+  - VApp.Import
+
+datastore:  # also: Browse + FileManagement on "image datastores" (role <name>-images) for ISO/OVA libraries
+  - Datastore.AllocateSpace
+  - Datastore.Browse                       # find ISOs already on the datastore
+  - Datastore.FileManagement               # upload ISOs and move them to their name ("Low level file operations")
+
+network:
+  - Network.Assign
+
+virtual_machine:  # granted on the folder so it applies to the new VM
+  - VirtualMachine.Config.CPUCount
+  - VirtualMachine.Config.Memory
+  - VirtualMachine.Config.DiskExtend
+  - VirtualMachine.Config.AddNewDisk
+  - VirtualMachine.Config.AddRemoveDevice
+  - VirtualMachine.Config.EditDevice
+  - VirtualMachine.Config.AdvancedConfig   # cloud-init guestinfo keys
+  - VirtualMachine.Config.Annotation
+  - VirtualMachine.Config.Settings
+  - VirtualMachine.Config.Resource         # lower an appliance's memory reservation when its memory is reduced
+  - VApp.ApplicationConfig                 # edit an imported OVA's properties (static address bound to NIC 1)
+  - VirtualMachine.Interact.PowerOn
+  - VirtualMachine.Interact.PowerOff
+  - VirtualMachine.Interact.ConsoleInteract
+  - VirtualMachine.Interact.DeviceConnection
+  - VirtualMachine.Interact.SetCDMedia
+  - VirtualMachine.State.CreateSnapshot
+
+vtpm:  # granted on the folder; only checked when a VM gets a virtual TPM (Windows 11, optional for others)
+  - Cryptographer.Clone
+  - Cryptographer.Encrypt
+  - Cryptographer.EncryptNew
+  - Cryptographer.Migrate
+  - Cryptographer.RegisterVM
+  - Cryptographer.RegisterHost
+  - Cryptographer.Access                   # "Direct Access": open the console of a VM with a vTPM
+
+compatibility_upgrade:  # granted on the folder; only checked when a deployment upgrades VM compatibility
+  - VirtualMachine.Config.UpgradeVirtualHardware

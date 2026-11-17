@@ -1,0 +1,79 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vsphere-vm-deployment"
+version = "0.1.0"
+description = "Interactive, GUI-free VM deployment to vCenter Server and ESXi from OVA, OVF or ISO images."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.11"
+authors = [{ name = "Peter Amirian" }]
+keywords = ["vsphere", "vcenter", "esxi", "ova", "ovf", "iso", "cloud-init", "automation", "Peter's Projects"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: System Administrators",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
+  "Topic :: System :: Systems Administration",
+]
+dependencies = [
+  "pyvmomi>=9.0",
+  # 14.1+: nested live displays (a status spinner inside the deployment view); 14.0 raises LiveError.
+  "rich>=14.1",
+  "questionary>=2.0",
+  "typer>=0.12",
+  # 6.0.2+: 6.0.0 cannot build with Cython 3, and 6.0.2 is the first with Python 3.13 wheels. On a Python
+  # release newer than PyYAML's wheels, pip compiles it; see README "If pip tries to compile something".
+  "pyyaml>=6.0.2",
+  "pydantic>=2.6",
+  "keyring>=24",
+  "platformdirs>=4",
+  # 50+: every older release has published vulnerabilities (pip-audit), and pip keeps an already-installed
+  # version that satisfies the minimum.
+  "cryptography>=50",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.5"]
+
+[project.scripts]
+vmdeploy = "vsphere_vm_deployment.cli:main"
+vsphere-vm-deploy = "vsphere_vm_deployment.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/pedramamirian/vsphere-vm-deployment"
+Issues = "https://github.com/pedramamirian/vsphere-vm-deployment/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vsphere_vm_deployment"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+  "vcsim: integration tests that need the vcsim vCenter simulator binary (set VCSIM_BIN or put vcsim on PATH)",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+# PLW1514: every text-mode open/read_text/write_text must name its encoding, because the Windows default
+# is the ANSI code page (cp1252), not UTF-8. It is a preview rule, enabled on its own.
+preview = true
+explicit-preview-rules = true
+select = ["E", "F", "W", "I", "B", "UP", "S", "PLW1514"]
+ignore = ["S101", "S105", "S106", "S603", "S607", "S310", "S608", "E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "B"]

@@ -1,0 +1,13 @@
+# A vendor appliance OVA with a deployment size and its own settings (OVF properties).
+# Property keys are shown by an interactive run; anything not set here is asked for.
+#   vmdeploy deploy -f examples/appliance-ova.yaml --url https://vendor.example/appliance.ova --sha256 <hash>
+vm:
+  name: appliance01
+ovf:
+  deployment_option: small
+  properties: {}
+    # e.g.  properties: {vami.ip0.MyAppliance: 198.51.100.20, vami.gateway.MyAppliance: 198.51.100.1}
+  accept_eula: false             # only used with --yes; interactive runs always show the licence
+networks:
+  - ovf_network: Network 1
+    portgroup: Mgmt

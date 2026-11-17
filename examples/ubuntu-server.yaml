@@ -1,0 +1,42 @@
+# Ubuntu Server LTS with a static IP and SSH-key login.
+#   vmdeploy deploy -f examples/ubuntu-server.yaml
+# Anything left out (e.g. the datastore) is asked for interactively.
+profile: lab                     # connection profile created with `vmdeploy profile add`
+
+vm:
+  name: web01
+  notes: Web server
+
+image:
+  preset: ubuntu-lts             # newest Ubuntu LTS cloud OVA, verified against Canonical's SHA-256
+
+placement:
+  cluster: Lab-Cluster           # omit host: to let DRS choose
+  folder: /Servers
+  datastore: nvme-ds01
+
+resources:
+  cpu: 4
+  memory_gb: 8
+  disk_gb: 60                    # the image's small disk is grown to this size
+  disk_provisioning: thin
+
+networks:
+  - portgroup: VLAN20-Servers
+
+guest:
+  hostname: web01
+  username: alex
+  ssh_authorized_keys:
+    - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIReplaceWithYourOwnPublicKey alex@workstation
+  timezone: Etc/UTC
+  network:
+    mode: static
+    address: 192.0.2.50/24
+    gateway: 192.0.2.1
+    dns: [192.0.2.1]
+
+post_deploy:
+  power_on: true
+  wait_for_ip: true
+  snapshot: true                 # "clean-baseline" snapshot after first boot

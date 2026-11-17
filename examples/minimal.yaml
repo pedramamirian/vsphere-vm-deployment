@@ -1,0 +1,4 @@
+# The smallest manifest: everything else is read from the image or asked interactively.
+#   vmdeploy deploy -f examples/minimal.yaml --preset ubuntu-lts
+vm:
+  name: test-vm01

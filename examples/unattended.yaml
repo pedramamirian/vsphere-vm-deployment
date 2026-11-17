@@ -1,0 +1,17 @@
+# Fully non-interactive run for automation. Every decision is in the file:
+#   VMDEPLOY_PASSWORD=... vmdeploy deploy -f examples/unattended.yaml --yes --json            (macOS / Linux)
+#   $env:VMDEPLOY_PASSWORD = '...'; vmdeploy deploy -f examples/unattended.yaml --yes --json   (PowerShell;
+#   then Remove-Item Env:VMDEPLOY_PASSWORD, so the password does not stay in the session)
+# The certificate must already be trusted (`vmdeploy trust add <host>`) or passed with --trust-fingerprint.
+profile: lab
+vm: {name: build-agent-07}
+image: {preset: ubuntu-24.04}
+placement: {cluster: Lab-Cluster, datastore: nvme-ds01, folder: /CI}
+resources: {cpu: 2, memory_gb: 4, disk_gb: 40, disk_provisioning: thin}
+networks: [{portgroup: VLAN40-Build}]
+guest:
+  hostname: build-agent-07
+  username: ci
+  ssh_authorized_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIReplaceWithYourOwnPublicKey ci@runner"]
+  network: {mode: dhcp}
+post_deploy: {power_on: true, wait_for_ip: true, snapshot: false}

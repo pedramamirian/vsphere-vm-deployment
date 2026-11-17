@@ -1,0 +1,16 @@
+# Create a VM that boots an installer ISO. The tool creates the VM, uploads/attaches the ISO and powers it on;
+# you then finish the OS installation in the VM console.
+#   vmdeploy deploy -f examples/iso-install.yaml --local ubuntu-24.04-live-server-amd64.iso
+vm:
+  name: win-or-linux-from-iso
+resources:
+  cpu: 2
+  memory_gb: 4
+  disk_gb: 80
+  disk_provisioning: thin
+hardware:
+  guest_os: ubuntu64Guest        # vSphere guest ID; omit to choose from the host's list
+  firmware: efi
+  secure_boot: false
+networks:
+  - portgroup: VM Network

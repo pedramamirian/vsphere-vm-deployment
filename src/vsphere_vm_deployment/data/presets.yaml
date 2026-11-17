@@ -1,0 +1,31 @@
+# Named image presets for `--preset`. Adding a preset needs no code changes, only a new entry here
+# (and a resolver, if it uses a new metadata source).
+#
+# resolver: ubuntu-simplestreams reads Canonical's Simplestreams image metadata
+#   (https://cloud-images.ubuntu.com/releases/streams/v1/com.ubuntu.cloud:released:download.json),
+#   picks the newest matching release, and verifies the download against the SHA-256 published there.
+# provisioning: cloud-init  -> the image supports first-boot customisation (hostname, user, SSH keys, IP).
+
+ubuntu-lts:
+  description: Newest Ubuntu Server LTS cloud image (OVA), resolved automatically
+  resolver: ubuntu-simplestreams
+  channel: lts
+  arch: amd64
+  provisioning: cloud-init
+  guest_os: ubuntu64Guest
+
+ubuntu-24.04:
+  description: Ubuntu Server 24.04 LTS (Noble Numbat) cloud image (OVA)
+  resolver: ubuntu-simplestreams
+  release: noble
+  arch: amd64
+  provisioning: cloud-init
+  guest_os: ubuntu64Guest
+
+ubuntu-22.04:
+  description: Ubuntu Server 22.04 LTS (Jammy Jellyfish) cloud image (OVA)
+  resolver: ubuntu-simplestreams
+  release: jammy
+  arch: amd64
+  provisioning: cloud-init
+  guest_os: ubuntu64Guest

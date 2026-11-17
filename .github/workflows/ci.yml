@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install --upgrade pip
+      - run: pip install -e ".[dev]"
+      - run: ruff check src tests
+      - run: pytest -m "not vcsim"
+      # The installed console script starts on every OS (catches entry-point and import problems).
+      - run: vmdeploy --version
+      - run: vmdeploy --help
+
+  # The README tells users without a C compiler to install PyYAML's pure-Python build. Keep that path working.
+  pure-python-yaml:
+    runs-on: windows-latest
+    env:
+      PYYAML_FORCE_LIBYAML: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade pip
+      - run: pip install --no-binary pyyaml -e ".[dev]"
+      - run: python -c "import yaml, sys; sys.exit(1 if yaml.__with_libyaml__ else 0)"
+      - run: pytest -m "not vcsim"
+
+  vcsim:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      # A fixed release, the one the end-to-end tests were written against: a new vcsim must not change CI on its own.
+      - name: Install vcsim (govmomi vCenter simulator)
+        run: |
+          curl -fsSL -o vcsim.tgz https://github.com/vmware/govmomi/releases/download/v0.54.0/vcsim_Linux_x86_64.tar.gz
+          mkdir -p "$HOME/bin" && tar -xzf vcsim.tgz -C "$HOME/bin" vcsim
+          echo "VCSIM_BIN=$HOME/bin/vcsim" >> "$GITHUB_ENV"
+      - run: pip install -e ".[dev]"
+      - run: pytest -m vcsim -v
