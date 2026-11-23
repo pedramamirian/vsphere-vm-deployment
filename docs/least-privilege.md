@@ -64,6 +64,8 @@ administrator privilege that the deploy account never gets.
 For unattended use, pass every answer on the command line, e.g.
 `vmdeploy access setup -p vc-admin --yes --user svc-deploy@vsphere.local --new-folder vmdeploy-svc-deploy --compute Cluster01
 --datastore ds01 --network "VM Network"`.
+For batches across several hosts or clusters, choose them all (a checklist), or repeat `--compute`: each gets its
+placement grant (not propagated, so existing VMs there stay out of reach).
 
 ## Privileges
 
@@ -71,7 +73,7 @@ For unattended use, pass every answer on the command line, e.g.
 |---|---|---|
 | Any object (read) | `System.Anonymous`, `System.View`, `System.Read` | Discover the inventory |
 | Target **VM folder** | `VirtualMachine.Inventory.Create`, `VirtualMachine.Inventory.Delete`, `VApp.Import` | Create VMs, deploy OVA/OVF, clean up failed deployments, `vmdeploy destroy` |
-| Target **cluster / host / resource pool** | `Resource.AssignVMToPool`, `VApp.Import` | Place the VM |
+| Target **cluster(s) / host(s) / resource pool** | `Resource.AssignVMToPool`, `VApp.Import` | Place the VM |
 | Target **datastore(s)** | `Datastore.AllocateSpace`, `Datastore.Browse`, `Datastore.FileManagement` | Create disks, find ISOs, upload ISOs (an upload is then moved to its name, which never replaces an existing file) |
 | Target **network(s)** | `Network.Assign` | Connect the VM's NICs |
 | The VM folder (applies to new VMs) | `VirtualMachine.Config.CPUCount`, `.Memory`, `.DiskExtend`, `.AddNewDisk`, `.AddRemoveDevice`, `.EditDevice`, `.AdvancedConfig`, `.Annotation`, `.Settings`, `.Resource`; `VirtualMachine.Interact.PowerOn`, `.PowerOff`, `.ConsoleInteract`, `.DeviceConnection`, `.SetCDMedia`; `VirtualMachine.State.CreateSnapshot`; `VApp.ApplicationConfig` | Size, customise, power and snapshot the VM. `.Resource` lowers an appliance's memory reservation when its memory is reduced; `VApp.ApplicationConfig` edits an imported OVA's properties (a static address bound to NIC 1) |

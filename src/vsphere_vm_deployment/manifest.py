@@ -153,11 +153,15 @@ class OvfSpec(Strict):
     @field_validator("properties", mode="before")
     @classmethod
     def _as_text(cls, v):
-        """YAML turns `true` and `22` into a boolean and a number; appliance settings are text to vCenter."""
-        if isinstance(v, dict):
-            return {k: (("true" if x else "false") if isinstance(x, bool) else
-                        str(x) if isinstance(x, int | float) else x) for k, x in v.items()}
-        return v
+        return _properties_as_text(v)
+
+
+def _properties_as_text(v):
+    """YAML turns `true` and `22` into a boolean and a number; appliance settings are text to vCenter."""
+    if isinstance(v, dict):
+        return {k: (("true" if x else "false") if isinstance(x, bool) else
+                    str(x) if isinstance(x, int | float) else x) for k, x in v.items()}
+    return v
 
 
 class GuestNetwork(Strict):
@@ -195,6 +199,17 @@ class GuestSpec(Strict):
     timezone: str | None = None
     ntp_servers: list[str] = Field(default_factory=list)
     network: GuestNetwork | None = None
+    # With DHCP: how the guest identifies itself to the DHCP server. "mac": by its MAC address, set before the first
+    # boot (DHCP reservations by MAC then work, and a fresh Ubuntu image does not ask under a second identity).
+    # "image": the image's default (Ubuntu: an identifier derived from the machine id, not the MAC).
+    dhcp_identifier: str = "mac"
+
+    @field_validator("dhcp_identifier")
+    @classmethod
+    def _dhcp_identifier(cls, v: str) -> str:
+        if v not in ("mac", "image"):
+            raise ValueError("guest.dhcp_identifier must be 'mac' or 'image'")
+        return v
 
     @field_validator("hostname")
     @classmethod
@@ -231,6 +246,120 @@ class VmSpec(Strict):
         return v
 
 
+# ------------------------------------------------------------------------------------------------ batch
+# One image, the same settings, many targets (docs/design/batch-deployment.md). The rest of the manifest holds the
+# settings every VM shares; `batch:` says where the VMs go and what differs between them.
+
+class BatchOvf(Strict):
+    """Per-target OVF property overrides. Values may use the batch placeholders ({name}, {n}, {address}, ...)."""
+    properties: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("properties", mode="before")
+    @classmethod
+    def _as_text(cls, v):
+        return _properties_as_text(v)
+
+
+class BatchTarget(Strict):
+    """One selector: a host, every host of a cluster or host folder, hosts matching a name pattern, a DRS cluster,
+    or a resource pool (where hosts are hidden, e.g. hosted VMware clouds)."""
+    host: str | None = None
+    cluster: str | None = None
+    folder: str | None = None  # a host folder, e.g. "/Lab/Hosts"
+    hosts_matching: str | None = None  # shell-style pattern, e.g. "esx-east-*"
+    resource_pool: str | None = None
+    drs: bool = False  # with `cluster:` (or a resource pool in a DRS cluster): DRS places each VM
+    datastore: str | None = None  # a name, or "auto" (the usable datastore with the most free space)
+    count: int | None = Field(None, ge=1, le=1000)
+    ovf: BatchOvf | None = None
+
+    @model_validator(mode="after")
+    def _one_selector(self):
+        given = [k for k in ("host", "cluster", "folder", "hosts_matching") if getattr(self, k)]
+        if len(given) > 1:
+            raise ValueError(f"batch.targets: one of host, cluster, folder or hosts_matching per entry, got "
+                             f"{', '.join(given)}")
+        if not given and not self.resource_pool:
+            raise ValueError("batch.targets: each entry needs host, cluster, folder, hosts_matching or resource_pool")
+        if self.drs and not (self.cluster or self.resource_pool):
+            raise ValueError("batch.targets: drs: true needs a cluster (or a resource pool in a DRS cluster)")
+        return self
+
+
+class BatchAddresses(Strict):
+    """Guest IPv4 addresses for the batch's VMs (through cloud-init, or OVF properties that use {address})."""
+    mode: str = "dhcp"  # dhcp (nothing written: the image's default, normally DHCP) | static
+    range: str | None = None  # "192.0.2.50-192.0.2.69" (or "192.0.2.50-69")
+    addresses: list[str] = Field(default_factory=list, alias="list")  # one per VM, in VM order
+    prefix: int | None = Field(None, ge=1, le=32)  # e.g. 24; may also be given as address/prefix in `list`
+    gateway: str | None = None
+    dns: list[str] = Field(default_factory=list)
+    search: list[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    @model_validator(mode="after")
+    def _check(self):
+        if self.mode not in ("dhcp", "static"):
+            raise ValueError("batch.addresses.mode must be 'dhcp' or 'static'")
+        if self.mode == "static" and bool(self.range) == bool(self.addresses):
+            raise ValueError("batch.addresses: static addressing needs either `range` or `list` (one of them)")
+        if self.mode == "dhcp" and (self.range or self.addresses or self.gateway):
+            raise ValueError("batch.addresses: range, list and gateway are only used with mode: static")
+        from .netcheck import dns_error
+
+        if problem := dns_error(self.dns):
+            raise ValueError(f"batch.addresses.dns: {problem}")
+        return self
+
+
+class BatchParallel(Strict):
+    vms: int = Field(4, ge=1, le=64)  # VMs being built at the same time
+    uploads: int = Field(2, ge=1, le=32)  # uploads from this computer at the same time
+    per_host: int = Field(2, ge=1, le=64)  # VMs being built on one host at the same time
+
+
+class BatchSpec(Strict):
+    name: str | None = None  # VM name pattern, e.g. "web-{n:02}"
+    names: list[str] = Field(default_factory=list)  # or exactly one name per VM
+    start: int = Field(1, ge=0)  # the first {n}
+    name_conflict: str = "skip"  # skip | next-free | replace
+    hostname: str | None = None  # pattern, a fixed name, or "skip" (the image's own). Default: "{name}"
+    distribution: str = "per_host"  # per_host | total
+    count: int | None = Field(None, ge=1, le=1000)  # VMs per host (per_host, default 1) or in total (total)
+    targets: list[BatchTarget] = Field(default_factory=list)
+    addresses: BatchAddresses | None = None
+    parallel: BatchParallel = Field(default_factory=BatchParallel)
+    on_check_failure: str = "skip"  # skip | cancel (--yes; interactive runs ask)
+    on_failure: str = "continue"  # continue | stop
+    keep_failed: bool = False  # keep a VM that failed half-way, for troubleshooting
+
+    @model_validator(mode="after")
+    def _check(self):
+        choices = {"name_conflict": ("skip", "next-free", "replace"), "distribution": ("per_host", "total"),
+                   "on_check_failure": ("skip", "cancel"), "on_failure": ("continue", "stop")}
+        for key, allowed in choices.items():
+            if getattr(self, key) not in allowed:
+                raise ValueError(f"batch.{key} must be one of: {', '.join(allowed)}")
+        if self.name and self.names:
+            raise ValueError("batch: give either `name` (a pattern) or `names` (a list), not both")
+        for n in self.names:
+            if not VM_NAME_RE.fullmatch(n):
+                raise ValueError(f"batch.names: '{n}' must be 1-80 characters without / \\ or %")
+        if len(set(self.names)) != len(self.names):
+            raise ValueError("batch.names: the names must be different from each other")
+        from .batchplan import check_pattern
+
+        try:
+            if self.name:
+                check_pattern(self.name, "batch.name")
+            if self.hostname and self.hostname != "skip":
+                check_pattern(self.hostname, "batch.hostname", hostname=True)
+        except ConfigError as e:
+            raise ValueError(e.message) from None
+        return self
+
+
 class Manifest(Strict):
     profile: str | None = None
     vm: VmSpec = Field(default_factory=VmSpec)
@@ -242,6 +371,22 @@ class Manifest(Strict):
     ovf: OvfSpec = Field(default_factory=OvfSpec)
     guest: GuestSpec = Field(default_factory=GuestSpec)
     post_deploy: PostDeploy = Field(default_factory=PostDeploy)
+    batch: BatchSpec | None = None
+
+    @model_validator(mode="after")
+    def _batch_owns_placement(self):
+        """With `batch:` each VM's name, host and datastore come from the batch, and its hostname and address
+        from the batch patterns: the single-VM keys would be ambiguous, so they are refused, not ignored."""
+        if self.batch is None:
+            return self
+        clashes = [key for key, value in (
+            ("vm.name", self.vm.name), ("placement.host", self.placement.host),
+            ("placement.cluster", self.placement.cluster), ("placement.datastore", self.placement.datastore),
+            ("guest.hostname", self.guest.hostname), ("guest.network", self.guest.network)) if value]
+        if clashes:
+            raise ValueError(f"with batch: remove {', '.join(clashes)} (use batch.name, batch.targets, "
+                             "batch.hostname and batch.addresses instead)")
+        return self
 
 
 def load_manifest(path: str | Path | None) -> Manifest:

@@ -399,7 +399,7 @@ def _networks_fake(ovf_nets, specs):
     p = NS(select=lambda q, choices, **k: (asked.append(q), choices[0][1])[1], record=lambda *a: None)
     fake = NS(p=p, pkg=NS(info=NS(networks=ovf_nets)) if ovf_nets is not None else None,
               m=NS(networks=[NetworkSpec(**s) for s in specs]))
-    return fake, NS(dc=dc, host_names={"h1"}, networks=[]), asked
+    return fake, NS(dc=dc, host_names={"h1"}, batch_hosts=None, networks=[]), asked
 
 
 def test_named_and_positional_network_entries_are_each_used_once():
@@ -499,7 +499,12 @@ def test_nested_sections_keep_the_live_panel_stopped_until_the_outer_one_ends(mo
 
     v = ui.DeploymentView("t", [("a", "A", 1.0)], enabled=False)
     events = []
-    v._live = NS(stop=lambda: events.append("stop"), start=lambda: events.append("start"))
+
+    def fake_live():
+        return NS(stop=lambda: events.append("stop"), start=lambda: events.append("start"))
+
+    v._live = fake_live()
+    v._new_live = fake_live  # the panel comes back as a new Live (a restarted one erased lines above it)
     with v.paused("outer"):
         with v.paused("inner"):
             pass
@@ -512,9 +517,9 @@ def test_nested_sections_keep_the_live_panel_stopped_until_the_outer_one_ends(mo
     class Answer:
         def unsafe_ask(self):
             events.append("asked")
-            return True
+            return "yes"
 
-    monkeypatch.setattr(ui.questionary, "confirm", lambda *a, **k: Answer())
+    monkeypatch.setattr(ui.questionary, "text", lambda *a, **k: Answer())
     p = ui.Prompter(interactive=False, view=v)
     p.interactive = True  # pytest has no terminal, so the constructor would switch interactive mode off
     assert p.confirm("Continue?") is True

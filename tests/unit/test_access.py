@@ -450,3 +450,76 @@ def test_see_every_datastore_copy_rights_only_where_images_are():
     assert role.privilege == ["Datastore.Browse"]
     found = access.find_existing(conn)
     assert {"vmdeploy-deployer-browse", "vmdeploy-deployer-images"} <= set(found.roles)
+
+
+def test_several_hosts_and_clusters_each_get_a_placement_grant():
+    """A batch deploys to several hosts: `access setup` granted only one (found in real testing)."""
+    plan = access.build_vcenter_plan(make_conn(), principal="svc@vsphere.local", role_name="vmdeploy-deployer",
+                                     folder=("/Lab", Entity("Lab")),
+                                     compute=[("Host h1", Entity("h1")), ("Host h2", Entity("h2")),
+                                              ("Cluster C1", Entity("C1"))],
+                                     datastores=[("ds1", Entity("ds1"))], networks=[("VM Network", Entity("net"))])
+    placement = [g for g in plan.grants if g.label.endswith("(placement only)")]
+    assert [g.label for g in placement] == ["Host h1 (placement only)", "Host h2 (placement only)",
+                                            "Cluster C1 (placement only)"]
+    assert not any(g.propagate for g in placement)
+
+
+def test_a_chosen_host_left_without_a_datastore_or_network_is_caught(capsys):
+    """A host whose only datastore was not ticked is one the account cannot deploy to: easy to miss in a long
+    list (found in real testing). Interactive: choose again or keep; given on the command line: a warning."""
+    from vsphere_vm_deployment.cli import _pick_covering
+
+    answers = iter([["ds-a"], "again", ["ds-a", "ds-c"]])
+    asked = []
+    p = NS(interactive=True, checkbox=lambda q, c, **k: asked.append(q) or next(answers),
+           select=lambda q, c, **k: asked.append(q) or next(answers), record=lambda *a: None)
+    where = {"ds-a": {"h1", "h2"}, "ds-c": {"h3"}}
+    choices = [("ds-a", "ds-a"), ("ds-c", "ds-c")]
+    got = _pick_covering(p, None, "Datastores:", choices, "--datastore", {"h1", "h2", "h3"}, where.get, "datastore")
+    assert got == ["ds-a", "ds-c"] and asked == ["Datastores:", "Choose the datastores again?", "Datastores:"]
+    assert "No chosen datastore on h3" in capsys.readouterr().err
+    got = _pick_covering(p, ["ds-a"], "Datastores:", choices, "--datastore", {"h1", "h3"}, where.get, "datastore")
+    assert got == ["ds-a"] and "No chosen datastore on h3" in capsys.readouterr().err
+
+
+def test_checklists_say_how_to_pick_many_and_a_long_one_asks_a_pattern_first(monkeypatch, capsys):
+    """questionary's type-to-filter let its select-all (Ctrl+A) also pick the entries the filter hid: an access
+    setup could grant every datastore while the screen showed eight. A long list now asks for a pattern first and
+    lists only the matches, so `a` takes what is listed; a pattern that matches nothing pickable is asked again."""
+    from vsphere_vm_deployment import ui
+
+    seen, patterns = [], []
+    typed = iter(["*south*", "*east*"])
+    monkeypatch.setattr(ui.questionary, "text", lambda q, **k: patterns.append(q) or NS(unsafe_ask=lambda: next(typed)))
+    monkeypatch.setattr(ui.questionary, "checkbox", lambda q, **k: seen.append(k) or NS(unsafe_ask=lambda: ["a"]))
+    p = ui.Prompter(interactive=False)
+    p.interactive = True  # pytest has no terminal
+    p.checkbox("Hosts:", [(f"h{i}", f"h{i}") for i in range(4)])
+    assert patterns == [] and "a selects all" in seen[0]["instruction"]
+    hosts = [(f"esx-{side}-{i:02}  (16 cores)", f"esx-{side}-{i:02}") for side in ("east", "west") for i in range(10)]
+    p.checkbox("Datastores the account may use:", hosts)
+    assert len(patterns) == 2 and "20 to choose from" in patterns[0]
+    assert "Nothing that can be picked matches '*south*'" in capsys.readouterr().err
+    assert [c.value for c in seen[1]["choices"]] == [f"esx-east-{i:02}" for i in range(10)]
+    assert not seen[1].get("use_search_filter") and "a selects all listed" in seen[1]["instruction"]
+
+
+def test_a_long_checklist_takes_a_retrys_answer_before_any_pattern(monkeypatch):
+    from vsphere_vm_deployment import ui
+
+    monkeypatch.setattr(ui.questionary, "text", lambda q, **k: pytest.fail("no pattern question on a retry"))
+    p = ui.Prompter(interactive=False)
+    p.interactive = True
+    p.replay = {"batch.targets": [["host", "esx-17"]]}
+    hosts = [(f"esx-{i:02}", ("host", f"esx-{i:02}")) for i in range(30)]
+    assert p.checkbox("Deploy to:", hosts, field_name="batch.targets") == [("host", "esx-17")]
+
+
+def test_checklist_patterns():
+    from vsphere_vm_deployment.ui import matches
+
+    assert matches("esx-east-01  (16 cores, 256 GB)", "esx-east-*")  # the whole label
+    assert matches("esx-east-01  (16 cores, 256 GB)", "*01")  # or the name before its details
+    assert matches("ssd-01  (2.1 TB free)", "SSD") and not matches("ssd-01", "sas")  # text: contained, any case
+    assert matches("Cluster Lab: every usable host (4)", "cluster*") and not matches("esx-a", "esx-[b-z]")

@@ -46,7 +46,7 @@ def iso_users(conn) -> dict[str, list[str]]:
                               "nothing was deleted.", hint="Run the command again.") from e
     for _obj, props in vms:
         for path in iso_paths(props.get("config.hardware.device")):
-            users.setdefault(path, []).append(props.get("name", "?"))
+            users.setdefault(path, []).append(inventory.display(props.get("name", "?")))
     return users
 
 

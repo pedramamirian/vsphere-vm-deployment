@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vsphere-vm-deployment"
-version = "0.1.0"
+version = "0.2.0"
 description = "Interactive, GUI-free VM deployment to vCenter Server and ESXi from OVA, OVF or ISO images."
 readme = "README.md"
 license = "Apache-2.0"

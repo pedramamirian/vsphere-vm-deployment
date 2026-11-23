@@ -204,7 +204,18 @@ def suggests_vtpm(guest_id: str | None) -> bool:
 
 
 def copy_target(dest_datastore: str, source_path: str) -> str:
-    return f"[{dest_datastore}] {ISO_FOLDER}/{source_path.rsplit('/', 1)[-1]}"
+    """Where vmdeploy copies an ISO on another datastore: vmdeploy-iso/<its file name>. `source_path` is a file
+    name, a local path or a datastore path ("[ds] file.iso" in the top folder has no "/" to split on)."""
+    return f"[{dest_datastore}] {ISO_FOLDER}/{file_name(source_path)}"
+
+
+def file_name(path: str) -> str:
+    """The file name of a datastore path, a local path (either slash) or a bare name."""
+    try:
+        path = split(path)[1]
+    except ValueError:
+        pass
+    return re.split(r"[/\\]", path)[-1]
 
 
 def copy_variant(fname: str, name: str) -> bool:

@@ -23,7 +23,8 @@ from rich.table import Table
 from . import __version__, appliances, compat, crypto, guestspecs, isolib, netcheck, vmnotes
 from . import cloudinit as ci
 from . import ovf as ovflib
-from .connection import Connection, connect
+from .batchplan import has_placeholder
+from .connection import Connection, connect, ensure_session
 from .errors import ConfigError, DeploymentError, PreflightError, TrustError, UserAborted, VmDeployError
 from .images import ResolvedImage, resolve
 from .inventory import ClusterInfo, DatacenterInventory, DatastoreInfo, GiB, HostInfo, NetworkInfo, discover
@@ -111,6 +112,18 @@ def suggest_vm_name(raw: str | None, existing: set[str] | None = None) -> str:
     name = re.sub(r"[-_ ]?(19|20)\d{6}(\.\d+)?$", "", name)  # trailing build date, e.g. -20261016
     name = re.sub(r"-{2,}", "-", name).strip("-_ ")[:60] or "new-vm"
     return next_free_vm_name(name, existing or set())
+
+
+def image_name_hint(pkg, image) -> str | None:
+    """What to suggest VM names from: an OVA/OVF's product name, else the image file's name without its extension
+    (never a local folder path, e.g. 'ubuntu-24.04.4-live-server-amd64' for an ISO)."""
+    if pkg is not None:
+        return pkg.info.name
+    source = getattr(image, "datastore_path", None) or getattr(image, "path", None) or getattr(image, "display", None)
+    if not source:
+        return None
+    name = isolib.file_name(str(source))
+    return name.rsplit(".", 1)[0] if "." in name else name
 
 
 def next_free_vm_name(name: str, existing: set[str], limit: int = 80) -> str:
@@ -215,9 +228,14 @@ class Plan:
     replace_vm: object = None
     warnings: list[str] = field(default_factory=list)
     blockers: list[str] = field(default_factory=list)  # must be fixed before deploying (e.g. IP conflict)
+    # A batch's shared plan: every host the batch's VMs may run on (the questions asked once for all of them,
+    # e.g. which networks to offer, look at all of them). None for one VM.
+    batch_hosts: set[str] | None = None
 
     @property
     def host_names(self) -> set[str]:
+        if self.batch_hosts is not None:
+            return set(self.batch_hosts)
         if self.host:
             return {self.host.name}
         if self.cluster:
@@ -226,11 +244,16 @@ class Plan:
 
 
 class Deployment:
-    def __init__(self, opts: DeployOptions):
+    # A batch deployment sets its `batch:` settings here (batch.BatchDeployment); None for one VM.
+    batch_spec = None
+    keep_partial = False  # a batch with --keep-failed keeps a VM that failed half-way instead of deleting it
+    cleanup_failed = False  # deleting a VM that failed half-way failed too: it is still there (a batch reports it)
+
+    def __init__(self, opts: DeployOptions, steps=STEPS):
         self.o = opts
         self.m = opts.manifest
         # "Choose placement and sizing" and "Review plan" are the user's own answers: no time shown for them.
-        self.view = DeploymentView(f"vsphere-vm-deployment {__version__}", STEPS, enabled=True,
+        self.view = DeploymentView(f"vsphere-vm-deployment {__version__}", steps, enabled=True,
                                    untimed=("configure", "plan"))
         self.p = Prompter(opts.interactive, self.view)
         self.trust = TrustManager(prompter=self.p, assume_fingerprints=opts.trust_fingerprints)
@@ -274,6 +297,25 @@ class Deployment:
         return self.summary
 
     def _run_steps(self) -> None:
+        inv = self._prepare()
+        self._plan_and_review(inv)
+        # the review may have been open longer than the server's idle timeout: interactive runs ask for the password
+        # again, --yes runs sign in again by themselves
+        if ensure_session(self.conn, self.p) and not self.p.interactive:
+            self._say(f"[dim]The session had expired while the review was open: signed in again as "
+                      f"{esc(self.conn.user)}.[/]")
+        self._build()
+
+    def _say(self, markup: str) -> None:
+        """A message for the user outside the step view (e.g. during clean-up). A batch shows it on the VM's row."""
+        console.print(markup)
+
+    def _status(self, text: str):
+        """A spinner while something slow happens (e.g. waiting for vCenter to remove a VM)."""
+        return console.status(text)
+
+    def _prepare(self):
+        """Sign in, discover the inventory, get and inspect the image. Returns the inventory."""
         v = self.view
         # ---------------------------------------------------------------- connect
         v.start("connect", self.o.profile.endpoint)
@@ -305,7 +347,10 @@ class Deployment:
             v.note("inspect" if self.pkg else "image",
                    f"Recognised {self.appliance.name}: using {self.appliance.vendor}'s recommended settings.",
                    style="green")
+        return inv
 
+    def _plan_and_review(self, inv) -> None:
+        v = self.view
         # ------------------------------------------------- configure -> preflight -> review (repeatable)
         # "Change my answers" at the review comes back here; the image, sign-in and inventory are reused.
         while True:
@@ -328,6 +373,8 @@ class Deployment:
             self.p.start_revision()
         v.done("plan", "confirmed")
 
+    def _build(self) -> None:
+        """Create the VM from the confirmed plan (everything that changes vCenter/ESXi happens from here on)."""
         if self.plan.replace_vm is not None:
             self._destroy(self.plan.replace_vm, "existing VM (replace)")
 
@@ -813,7 +860,7 @@ class Deployment:
                                                            field_name="placement.datacenter")), False
 
     def _configure(self, inv) -> Plan:
-        p, m = self.p, self.m
+        p = self.p
         dcs = list(inv.datacenters.values())
         with p.section("Placement"):
             dc, by_iso = self._choose_datacenter(dcs)
@@ -846,7 +893,12 @@ class Deployment:
                 plan.nested_hv = self._ask_nested(plan)
             self._ask_guest(plan)
             self._ask_ovf_options(plan)
+        self._finish_configure(plan)
+        return plan
 
+    def _finish_configure(self, plan: Plan) -> None:
+        """Adapter types and the after-deployment settings (power on, wait for IP, snapshot)."""
+        p, m = self.p, self.m
         # Network adapters not set in the manifest: e1000e for Windows ISO installs (driver built into Windows
         # Setup), vmxnet3 otherwise (fastest; Linux has the driver).
         auto = "e1000e" if self.image.is_iso and isolib.is_windows(plan.guest_id) else "vmxnet3"
@@ -864,17 +916,16 @@ class Deployment:
             if pd.snapshot:
                 plan.warnings.append(f"{app.vendor} does not support snapshots of {app.name}; none is taken.")
             plan.snapshot = False
-        elif pd.snapshot is None and plan.power_on and not self.image.is_iso and self.p.interactive:
+        elif pd.snapshot is None and plan.power_on and not self.image.is_iso and                 self.p.would_ask("post_deploy.snapshot"):
             with p.section("After deployment"):
                 plan.snapshot = p.confirm("Take a 'clean baseline' snapshot once the VM has booted?", default=False,
                                           field_name="post_deploy.snapshot")
         else:
             plan.snapshot = bool(pd.snapshot) and plan.power_on and not self.image.is_iso
-        return plan
 
     def _ask_name(self, dc: DatacenterInventory) -> str:
         p = self.p
-        default = self.m.vm.name or suggest_vm_name(self.pkg.info.name if self.pkg else None, dc.vm_names)
+        default = self.m.vm.name or suggest_vm_name(image_name_hint(self.pkg, self.image), dc.vm_names)
         def valid(s: str):
             return bool(VM_NAME_RE.fullmatch(s)) or "1-80 characters, without / \\ or %"
 
@@ -1032,7 +1083,7 @@ class Deployment:
             if value:
                 return value
             default = ovf_value or fallback
-            if not p.interactive and default:
+            if not p.would_ask(field) and default:
                 return default
             return p.integer(question, default=default, minimum=minimum, maximum=maximum, field_name=field)
 
@@ -1070,7 +1121,7 @@ class Deployment:
         mem_default = (ovf_hw.get("memory_mb") or 0) / 1024 or (sug.memory_mb / 1024 if sug else 4)
         if r.memory_gb:
             mem_gb = r.memory_gb
-        elif not p.interactive:
+        elif not p.would_ask("resources.memory_gb"):
             mem_gb = mem_default
         else:
             mem_gb = float(p.text(f"Memory (GB){hint('memory')}:", default=f"{mem_default:g}",
@@ -1108,7 +1159,9 @@ class Deployment:
                            f"{plan.disk_gb} GB disk" + (f" + {len(plan.extra_disks)} extra disk(s)" if plan.extra_disks else ""))
 
         # Overcommit warnings (never blocking): compare against the chosen host, or the largest host in the cluster.
-        hosts = [host] if host else [plan.dc.hosts[n] for n in plan.host_names if n in plan.dc.hosts]
+        # A batch adds up its own VMs per host instead (batch.py).
+        hosts = [] if plan.batch_hosts is not None else \
+            [host] if host else [plan.dc.hosts[n] for n in plan.host_names if n in plan.dc.hosts]
         if hosts:
             ref = max(hosts, key=lambda h: h.cpu_threads)
             if max_cpu and plan.cpu > max_cpu:
@@ -1159,28 +1212,11 @@ class Deployment:
             plan.provisioning = Provisioning.THIN
             p.record("Datastore", f"{ds.name} (vSAN: the datastore's default storage policy is applied)")
         else:
-            vendor_prov = Provisioning(self.appliance.provisioning) if self.appliance and \
-                self.appliance.provisioning else None
-            rec = f" ({self.appliance.vendor} recommends)" if vendor_prov else ""
-            prov = self.m.resources.disk_provisioning or p.select(
-                "Disk provisioning:", [("Thin (allocate as used)" + (rec if vendor_prov == Provisioning.THIN else ""),
-                                        Provisioning.THIN),
-                                       ("Thick, lazy-zeroed" + (rec if vendor_prov == Provisioning.THICK else ""),
-                                        Provisioning.THICK),
-                                       ("Thick, eager-zeroed (slowest to create, needed for some clustering)"
-                                        + (rec if vendor_prov == Provisioning.EAGER else ""), Provisioning.EAGER)],
-                default=vendor_prov or Provisioning.THIN, field_name="resources.disk_provisioning",
-                assume_default=True)
-            plan.provisioning = prov
-            p.record("Datastore", f"{ds.name}, {prov.value} provisioning")
+            plan.provisioning = self._ask_provisioning()
+            p.record("Datastore", f"{ds.name}, {plan.provisioning.value} provisioning")
         # Extra disks without their own provisioning get the VM's (e.g. a vendor's eager-zeroed), not thin.
         plan.extra_disks = [(size, prov or plan.provisioning) for size, prov in plan.extra_disks]
-        need = self._needed_bytes(plan)
-        thin = plan.provisioning == Provisioning.THIN
-        initial = (self.pkg.total_disk_bytes() if self.pkg and thin else need) if not self.image.is_iso else \
-            (self.image.path.stat().st_size if self.image.path and thin else need)
-        if thin:  # thick extra disks take their full size right away
-            initial += sum(size for size, prov in plan.extra_disks if prov != Provisioning.THIN) * GiB
+        initial, need = self._space_needed(plan)
         if initial > ds.free:
             plan.warnings.append(f"Datastore {ds.name} has {human_size(ds.free)} free but this VM needs about "
                                  f"{human_size(initial)} right away; the deployment will probably fail.")
@@ -1191,6 +1227,31 @@ class Deployment:
             # (when the VM does not fit at all, the warning above already says so)
             plan.warnings.append(f"{ds.name} would be {(ds.provisioned + need) / ds.capacity * 100:.0f}% provisioned: "
                                  "its VMs could use more than its capacity if their thin disks fill up.")
+
+    def _ask_provisioning(self) -> Provisioning:
+        """Thin or thick disks (the vendor's recommendation is the default and is marked)."""
+        vendor_prov = Provisioning(self.appliance.provisioning) if self.appliance and \
+            self.appliance.provisioning else None
+        rec = f" ({self.appliance.vendor} recommends)" if vendor_prov else ""
+        return self.m.resources.disk_provisioning or self.p.select(
+            "Disk provisioning:", [("Thin (allocate as used)" + (rec if vendor_prov == Provisioning.THIN else ""),
+                                    Provisioning.THIN),
+                                   ("Thick, lazy-zeroed" + (rec if vendor_prov == Provisioning.THICK else ""),
+                                    Provisioning.THICK),
+                                   ("Thick, eager-zeroed (slowest to create, needed for some clustering)"
+                                    + (rec if vendor_prov == Provisioning.EAGER else ""), Provisioning.EAGER)],
+            default=vendor_prov or Provisioning.THIN, field_name="resources.disk_provisioning",
+            assume_default=True)
+
+    def _space_needed(self, plan: Plan) -> tuple[int, int]:
+        """(bytes the VM takes on its datastore right away, bytes it can grow to)."""
+        need = self._needed_bytes(plan)
+        thin = plan.provisioning == Provisioning.THIN
+        initial = (self.pkg.total_disk_bytes() if self.pkg and thin else need) if not self.image.is_iso else \
+            (self.image.path.stat().st_size if self.image.path and thin else need)
+        if thin:  # thick extra disks take their full size right away
+            initial += sum(size for size, prov in plan.extra_disks if prov != Provisioning.THIN) * GiB
+        return initial, need
 
     @staticmethod
     def _disk_growth(plan: Plan) -> int | None:
@@ -1224,6 +1285,15 @@ class Deployment:
                               hint="Remove the extra entries, or bind each entry to an image network with "
                                    "`ovf_network`." if ovf_nets else "Remove the extra entries.")
         by_slot = dict(zip(free_slots, positional, strict=False))
+        batch_hosts = plan.batch_hosts if plan.batch_hosts and len(plan.batch_hosts) > 1 else None
+
+        def choice_label(n) -> str:
+            """In a batch, say so before the review when a network is missing on some of the chosen hosts."""
+            if batch_hosts and n.hosts and not batch_hosts <= n.hosts:
+                return (f"{n.label()}  [on {len(n.hosts & batch_hosts)} of {len(batch_hosts)} hosts: the VMs on the "
+                        "others are skipped]")
+            return n.label()
+
         for i, ovf_name in enumerate(slots):
             spec = named.get(ovf_name) if ovf_name in named else by_slot.get(ovf_name) if ovf_name else (
                 specs[i] if i < len(specs) else None)
@@ -1237,7 +1307,7 @@ class Deployment:
                                       hint=f"Available: {', '.join(by_name)}")
             else:
                 label = f"Network for '{ovf_name}':" if ovf_name else f"Network for NIC {i + 1}:"
-                net = p.select(label, [(n.label(), n) for n in avail], field_name=f"networks[{i}].portgroup")
+                net = p.select(label, [(choice_label(n), n) for n in avail], field_name=f"networks[{i}].portgroup")
             plan.networks.append((ovf_name, net, adapter))
             p.record(f"NIC {i + 1}", f"{net.name}" + (f"  (image network '{ovf_name}')" if ovf_name else ""))
 
@@ -1400,15 +1470,18 @@ class Deployment:
             raise ConfigError(f"ovf.properties has keys the image does not define: {', '.join(sorted(unknown))}",
                               hint=f"Image properties: {', '.join(sorted(known)) or '(none)'}")
         for key, val in given.items():  # manifest values: the same checks as typed answers
+            if self.batch_spec is not None and has_placeholder(val):
+                continue  # a batch pattern such as {address}: checked per VM once filled in (batch.py)
             why = ovflib.check_value(known[key], val)
-            if why:
-                raise ConfigError(f"ovf.properties.{key}: {why}", hint=f"Given: {val!r}.")
+            if why:  # a password is never shown back
+                raise ConfigError(f"ovf.properties.{key}: {why}",
+                                  hint=None if known[key].password else f"Given: {val!r}.")
         if to_ask:
             with self.p.section("Image settings (OVF properties)"):
                 for pr in to_ask:
                     fname = f"ovf.properties.{pr.key}"
                     label = pr.label.strip().rstrip(".:?") or pr.key  # "…during upgrade." + "?" read badly
-                    if not self.p.interactive:
+                    if not self.p.would_ask(fname):
                         # Unattended: keep the image's default; vCenter rejects the import if a required
                         # property is still empty, and that error names the property.
                         if pr.default:
@@ -1466,13 +1539,16 @@ class Deployment:
                     default=True, assume=False, field_name="guest.enabled"):
                 return
             spec = g.model_copy(deep=True)
-            derived = re.sub(r"[^A-Za-z0-9-]", "-", plan.name)[:63].strip("-") or "vm"
-            if p.previous.get("guest.hostname") == p.previous.get("_derived_hostname"):
-                p.previous.pop("guest.hostname", None)  # it was the default: follow the (possibly new) VM name
-            spec.hostname = spec.hostname or p.text(
-                "Hostname:", default=derived, field_name="guest.hostname", assume_default=True,
-                validate=lambda s: bool(re.fullmatch(r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)", s)) or "letters, digits, hyphens")
-            p.answers["_derived_hostname"] = derived
+            batch = self.batch_spec is not None  # a batch asks hostnames and addresses as patterns (batch.py)
+            if not batch:
+                derived = re.sub(r"[^A-Za-z0-9-]", "-", plan.name)[:63].strip("-") or "vm"
+                if p.previous.get("guest.hostname") == p.previous.get("_derived_hostname"):
+                    p.previous.pop("guest.hostname", None)  # it was the default: follow the (possibly new) VM name
+                spec.hostname = spec.hostname or p.text(
+                    "Hostname:", default=derived, field_name="guest.hostname", assume_default=True,
+                    validate=lambda s: bool(re.fullmatch(r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)", s))
+                    or "letters, digits, hyphens")
+                p.answers["_derived_hostname"] = derived
             spec.username = spec.username or p.text("Admin username to create:", default="vmadmin",
                                                     field_name="guest.username",
                                                     validate=lambda s: bool(re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", s))
@@ -1485,7 +1561,7 @@ class Deployment:
                     spec.ssh_authorized_keys = [self._read_ssh_key()]
                 if how in ("password", "both"):
                     spec.password_hash = self._ask_password_hash()
-            if spec.network is None and p.interactive:
+            if spec.network is None and p.interactive and not batch:
                 mode = p.select("Guest IP addressing:", [("DHCP", "dhcp"), ("Static", "static")], default="dhcp",
                                 field_name="guest.network.mode")
                 if mode == "static":
@@ -1506,6 +1582,11 @@ class Deployment:
             # OVF properties reach the guest through vCenter (the OVF environment). A host reached directly drops
             # them, so the guest would boot without its user, key and hostname: use guestinfo there.
             plan.guest_route = "ovf" if info.has_cloud_init_properties and self.conn.is_vcenter else "guestinfo"
+            if batch:
+                p.record("Guest (every VM)", f"user {spec.username}, "
+                         f"{' + '.join(x for x, on in (('SSH key', spec.ssh_authorized_keys), ('password', spec.password_hash)) if on)}"
+                         "; hostnames and addresses are set per VM below")
+                return
             net = spec.network.mode if spec.network else "dhcp"
             complete = bool(g.hostname and g.username and (g.ssh_authorized_keys or g.password_hash) and g.network)
             p.record("Guest" + (" (from the manifest)" if complete else ""),
@@ -1921,7 +2002,7 @@ class Deployment:
             g = plan.guest
             login = " + ".join(x for x, on in (("SSH key", g.ssh_authorized_keys), ("password", g.password_hash)) if on)
             net = (f"static {g.network.address}" if g.network and g.network.mode == "static" and g.network.address
-                   else "DHCP")
+                   else "DHCP (identified by MAC address)" if ci.sets_dhcp_identifier(g) else "DHCP")
             mg = self.m.guest
             given = bool(mg.hostname and mg.username and (mg.ssh_authorized_keys or mg.password_hash) and mg.network)
             t.add_row("[bold]First boot", esc(
@@ -1969,9 +2050,16 @@ class Deployment:
 
     # ================================================================================== ISO pipeline
     def _deploy_iso(self) -> None:
-        plan, v = self.plan, self.view
+        v = self.view
         for k in ("upload_disks", "customize", "ip", "snapshot"):
             v.skip(k, "not applicable to ISO installs")
+        self._stage_iso()
+        self._create_iso_vm()
+
+    def _stage_iso(self) -> None:
+        """Make sure the ISO is on a datastore the VM's host can use: used where it is, copied host to host, or
+        uploaded from this computer. Sets plan.iso_datastore_path."""
+        plan, v = self.plan, self.view
         if plan.iso_found_on_datastore and not self._copy_is_genuine(plan.iso_copy_from or plan.iso_datastore_path):
             # Not the same file after all (or unreadable), and now in iso_rejected: one of vmdeploy's earlier uploads
             # that passes the full check is used instead, otherwise the verified local ISO is uploaded.
@@ -2003,6 +2091,8 @@ class Deployment:
         else:
             self._upload_iso()
 
+    def _create_iso_vm(self) -> None:
+        plan, v = self.plan, self.view
         v.start("create", "creating VM with an empty disk and the ISO attached")
         annotation = self._annotation()
         spec = create_spec(name=plan.name, guest_id=plan.guest_id, datastore_name=plan.datastore.name, cpu=plan.cpu,
@@ -2065,7 +2155,7 @@ class Deployment:
                 if props.get("runtime.powerState") != "poweredOn":
                     continue
                 if target in isocopies.iso_paths(props.get("config.hardware.device"), connected_only=True):
-                    names.append(props.get("name", "?"))
+                    names.append(inventory.display(props.get("name", "?")))
         except Exception as e:  # noqa: BLE001 - diagnosis only
             log.debug("could not check which VMs use %s: %s", iso_path, e)
         return names
@@ -2173,11 +2263,11 @@ class Deployment:
 
         deadline = time.monotonic() + 60  # the host may hold the file briefly after the connection drops
         try:
-            with console.status(f"Deleting the partly uploaded {esc(full)}..."):
+            with self._status(f"Deleting the partly uploaded {esc(full)}..."):
                 while True:
                     try:
                         isocopies.delete(self.conn, self.inv, full, self.plan.dc.name)
-                        console.print(f"[green]Deleted the partly uploaded ISO {esc(full)}.[/]")
+                        self._say(f"[green]Deleted the partly uploaded ISO {esc(full)}.[/]")
                         return
                     except Exception as e:  # noqa: BLE001
                         ds_name, path = isolib.split(full)
@@ -2189,7 +2279,7 @@ class Deployment:
                         time.sleep(5)
         except BaseException as e:  # noqa: BLE001 - never mask the original failure
             log.warning("could not delete the partial upload %s: %s", full, e)
-            console.print(f"[yellow]The partly uploaded ISO {esc(full)} may be left on the datastore; "
+            self._say(f"[yellow]The partly uploaded ISO {esc(full)} may be left on the datastore; "
                           "`vmdeploy images prune` deletes it.[/]")
 
     # ================================================================================== OVA pipeline
@@ -2253,7 +2343,9 @@ class Deployment:
             upgraded = [f"compatibility upgraded to {compat.describe(plan.hardware_version)}"]
         extra = None
         if plan.guest and plan.guest_route == "guestinfo":
-            extra = ci.guestinfo_extra_config(user_data, ci.render_metadata(plan.guest.hostname, plan.guest))
+            # DHCP written for the identifier only: bound to NIC 1, so other adapters keep the image's behaviour
+            mac = self._nic1_mac_or_none(plan) if ci.sets_dhcp_identifier(plan.guest) else None
+            extra = ci.guestinfo_extra_config(user_data, ci.render_metadata(plan.guest.hostname, plan.guest, mac=mac))
         # Images without a NetworkSection have no NIC to map; add the requested NICs instead.
         new_nics = [(net, adapter) for ovf, net, adapter in plan.networks if not ovf] if not info.networks else []
         rspec, changes = reconfigure_spec(self.vm, cpu=plan.cpu, cores_per_socket=plan.cores_per_socket,
@@ -2274,10 +2366,12 @@ class Deployment:
 
         if plan.guest and plan.guest.network and plan.guest.network.mode == "static" and len(plan.networks) > 1:
             self._bind_static_address_to_nic1(plan, user_data, info)
+        if plan.guest and plan.guest_route == "ovf" and ci.sets_dhcp_identifier(plan.guest):
+            self._set_ovf_network_config(plan)
 
         if plan.guest:
             v.done("customize", f"cloud-init via {'OVF properties' if plan.guest_route == 'ovf' else 'guestinfo'} "
-                                f"(hostname {plan.guest.hostname}, user {plan.guest.username})")
+                                f"(hostname {plan.guest.hostname or 'from the image'}, user {plan.guest.username})")
         else:
             v.skip("customize", "not requested" if not info.has_cloud_init_properties else "skipped by user")
 
@@ -2298,6 +2392,48 @@ class Deployment:
         ordered = sorted((c for c in cards if on_first_network(c)), key=lambda c: c.key) or \
             sorted(cards, key=lambda c: c.key)
         return ordered[0].macAddress if ordered and ordered[0].macAddress else None
+
+    def _nic1_mac_or_none(self, plan: Plan) -> str | None:
+        """NIC 1's MAC address, or None when the VM has no adapter yet (they are added by the reconfigure) or it
+        cannot be read: the settings then match every `en*` adapter, as before."""
+        if not plan.networks:
+            return None
+        try:
+            return self._nic1_mac(plan)
+        except Exception as e:  # noqa: BLE001
+            log.debug("could not read NIC 1's MAC address: %s", e)
+            return None
+
+    def _set_ovf_network_config(self, plan: Plan) -> None:
+        """DHCP with the MAC address as client identifier, for images customised through OVF properties: cloud-init
+        reads a `network-config` OVF property before the network starts. Images such as Ubuntu's cloud OVA do not
+        declare it, so it is added to the VM (before its first boot). If that fails, the image's own DHCP settings
+        stay and the deployment goes on."""
+        v, g = self.view, plan.guest
+        mac = self._nic1_mac_or_none(plan)
+        value = ci.ovf_network_config(g, mac)
+        if value is None:
+            return
+        props = list(getattr(self.vm.config.vAppConfig, "property", None) or [])
+        existing = next((p for p in props if p.id == ci.OVF_NETWORK_CONFIG and not p.classId and not p.instanceId),
+                        None)
+        if existing is not None:
+            edit = vim.vApp.PropertySpec(operation="edit", info=vim.vApp.PropertyInfo(key=existing.key, value=value))
+        else:
+            edit = vim.vApp.PropertySpec(operation="add", info=vim.vApp.PropertyInfo(
+                key=max((p.key for p in props), default=0) + 1, id=ci.OVF_NETWORK_CONFIG, type="string",
+                value=value, userConfigurable=True,
+                label="Network configuration (cloud-init, base64)", description="Added by vsphere-vm-deployment"))
+        spec = vim.vm.ConfigSpec(vAppConfig=vim.vApp.VmConfigSpec(property=[edit]))
+        try:
+            wait_task(self.vm.ReconfigVM_Task(spec=spec), what="Set the DHCP client identifier")
+        except DeploymentError as e:
+            plan.warnings.append(f"Could not set the DHCP client identifier ({e.message}); the image's default is "
+                                 "used, so a DHCP reservation by MAC address may not match.")
+            v.note("customize", plan.warnings[-1])
+            return
+        v.note("customize", "DHCP: the guest identifies itself by its MAC address"
+               + (f" ({mac})" if mac else "") + ".", style="dim")
 
     def _bind_static_address_to_nic1(self, plan: Plan, user_data: str, info) -> None:
         """Several NICs and a static address: written with netplan's `en*` match, every adapter would get the
@@ -2482,12 +2618,13 @@ class Deployment:
                 v.done("ip", ip)
             else:
                 v.done("ip", "no IPv4 address reported", status="warn")
-                if not plan.guest:
+                cloud_image = bool(self.pkg and self.pkg.info.has_cloud_init_properties)  # e.g. Ubuntu: runs Tools
+                if not plan.guest and not cloud_image:
                     # Vendor appliances configure themselves; many (routers, firewalls) never report their address
                     # to vCenter, even with one (Cisco Catalyst 8000V got its DHCP address within the wait).
                     v.note("ip", "VMware Tools did not report an address. Many appliances do not report theirs to "
                                  "vCenter even when they have one, or are still booting: check in the VM console.")
-                elif not (plan.guest.network and plan.guest.network.mode == "static"):
+                elif not (plan.guest and plan.guest.network and plan.guest.network.mode == "static"):
                     v.note("ip", "The VM may still be booting, or the network may have no DHCP server: check in the "
                                  "VM console, or redeploy with a static address.")
         elif v.steps["ip"].status == "pending":
@@ -2499,8 +2636,9 @@ class Deployment:
                 v.note("ip", f"The address changed to {latest} after it was first reported ({ip}).", style="yellow")
                 ip = latest
             if not (plan.guest and plan.guest.network and plan.guest.network.mode == "static"):
+                mac = self._nic1_mac_or_none(plan) if ci.sets_dhcp_identifier(plan.guest) else None
                 v.note("ip", "Assigned by DHCP: it can change later. Reserve it on your DHCP server for a fixed "
-                             "address.", style="dim")
+                             "address" + (f" (MAC address {mac})." if mac else "."), style="dim")
 
         if plan.snapshot:
             v.start("snapshot")
@@ -2533,6 +2671,7 @@ class Deployment:
             return getattr(self, "_ip_candidate", None)  # the last address seen, if any (re-read below)
 
     IP_SETTLE_S = 30  # an address must stay the same this long before it is reported
+    IP_WAIT_HINT = "; Ctrl-C to stop waiting"  # shown while waiting (a batch leaves it out)
 
     @staticmethod
     def _current_ipv4(vm) -> str | None:
@@ -2565,13 +2704,13 @@ class Deployment:
             elapsed = int(now - start)
             if seen:
                 self.view.update("ip", f"{seen} reported; checking it stays the same "
-                                       f"({wait_text(int(now - seen_at), self.IP_SETTLE_S)}; "
-                                       "Ctrl-C to stop waiting)", fraction=min(0.95, elapsed / timeout))
+                                       f"({wait_text(int(now - seen_at), self.IP_SETTLE_S)}{self.IP_WAIT_HINT})",
+                                 fraction=min(0.95, elapsed / timeout))
                 time.sleep(3)
                 continue
             guest = vm.guest
             self.view.update("ip", f"waiting for VMware Tools ({wait_text(elapsed, timeout)}, tools: "
-                                   f"{guest.toolsRunningStatus}; Ctrl-C to stop waiting)",
+                                   f"{guest.toolsRunningStatus}{self.IP_WAIT_HINT})",
                              fraction=min(0.95, elapsed / timeout))
             time.sleep(3)
         return seen  # may still change; the final check below reads it again
@@ -2608,16 +2747,16 @@ class Deployment:
         """After an aborted import vCenter deletes the partial VM itself; check it did, and delete it if not."""
         name = getattr(self.plan, "name", "the VM")
         deadline = time.monotonic() + self.IMPORT_ABORT_WAIT_S
-        with console.status(f"Waiting for vCenter to remove the partially created VM '{name}'..."):
+        with self._status(f"Waiting for vCenter to remove the partially created VM '{name}'..."):
             while time.monotonic() < deadline:
                 if _vm_gone(vm):
                     folder = self._delete_import_folder()
                     if folder == "failed":
-                        console.print(f"[yellow]The upload was stopped and vCenter removed the partially created VM "
+                        self._say(f"[yellow]The upload was stopped and vCenter removed the partially created VM "
                                       f"'{name}', but its folder {esc(self.vm_dir)} could not be deleted. Delete it in "
                                       "the vSphere Client (datastore Files tab).[/]")
                     else:
-                        console.print(f"[green]The upload was stopped and the partially created VM '{name}' was "
+                        self._say(f"[green]The upload was stopped and the partially created VM '{name}' was "
                                       "removed" + (" (vCenter removed the VM; vmdeploy deleted its folder)"
                                                    if folder == "deleted" else "") + ". Nothing is left behind.")
                     return
@@ -2625,9 +2764,10 @@ class Deployment:
         log.warning("vCenter did not remove %s after the aborted import; deleting it", name)
         try:
             self._destroy(vm, f"partially created VM '{name}'")
-            console.print(f"[green]Removed the partially created VM '{name}'.")
+            self._say(f"[green]Removed the partially created VM '{name}'.")
         except BaseException as e:  # noqa: BLE001 - never mask the original failure
-            console.print(f"[red]Could not remove '{name}' automatically: {e}. Remove it with `vmdeploy destroy "
+            self.cleanup_failed = True
+            self._say(f"[red]Could not remove '{name}' automatically: {e}. Remove it with `vmdeploy destroy "
                           f"{name}`.")
 
     # The host can hold the half-written disk open for minutes after an abort (seen in the lab: ~2.5 min for a
@@ -2652,7 +2792,7 @@ class Deployment:
             return "none"
         deadline = time.monotonic() + self.IMPORT_FOLDER_RETRY_S
         try:
-            with console.status(f"Deleting the folder {esc(self.vm_dir)}: the host may take a few minutes to release "
+            with self._status(f"Deleting the folder {esc(self.vm_dir)}: the host may take a few minutes to release "
                                 "the disk (Ctrl+C to skip and delete it yourself later)..."):
                 return self._retry_folder_delete(ds_name, base, deadline)
         except KeyboardInterrupt:
@@ -2694,24 +2834,27 @@ class Deployment:
             return
         name = getattr(self.plan, "name", "the VM")
         if self.vm_ready:
-            console.print(f"[yellow]'{name}' was fully created before the failure, so it has been kept. Review it in "
-                          "vCenter, or remove it with `vmdeploy destroy`.[/]")
+            self._say(f"[yellow]'{name}' was fully created before the failure, so it has been kept. Review it in "
+                      "vCenter, or remove it with `vmdeploy destroy`.[/]")
             return
         try:
-            keep = False
-            if self.p.interactive and not isinstance(exc, KeyboardInterrupt):
+            keep = bool(self.keep_partial)  # a batch with --keep-failed: kept for troubleshooting, never asked
+            if keep:
+                pass
+            elif self.p.interactive and not isinstance(exc, KeyboardInterrupt):
                 keep = not self.p.confirm(f"The deployment failed after '{name}' was created. Delete the partially "
                                           "created VM?", default=True)
             elif self.p.interactive:
                 keep = not self.p.confirm(f"Cancelled. Delete the partially created VM '{name}'?", default=True)
             if keep:
-                console.print(f"[yellow]Left '{name}' in place for troubleshooting.")
+                self._say(f"[yellow]Left '{name}' in place for troubleshooting.")
                 return
             self._destroy(self.vm, f"partially created VM '{name}'")
-            console.print(f"[green]Removed the partially created VM '{name}'.")
+            self._say(f"[green]Removed the partially created VM '{name}'.")
         except BaseException as e:  # noqa: BLE001 - never mask the original failure
             log.warning("cleanup failed: %s", e)
-            console.print(f"[red]Could not remove '{name}' automatically: {e}. Remove it manually.")
+            self.cleanup_failed = True
+            self._say(f"[red]Could not remove '{name}' automatically: {e}. Remove it manually.")
 
 
 def _on_standalone_host(plan) -> bool:

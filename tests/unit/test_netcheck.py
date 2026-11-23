@@ -102,3 +102,29 @@ def test_free_address_in_the_right_subnet_is_clean():
 def test_replaced_vm_is_ignored():
     blockers, _ = find_conflicts(LAB, "198.51.100.214/24", "VM-LAN", ignore_vm="vmdeploy-test-ubuntu01")
     assert blockers == []
+
+
+def test_vm_names_are_shown_as_typed_in_vcenter(monkeypatch):
+    """Found in a real batch: the API escapes '/' in names as %2f, and a VM called 'App/DB' was reported as
+    'App%2fDB'. Names read in bulk are given as typed, so they also match names the user typed."""
+    from types import SimpleNamespace
+
+    from vsphere_vm_deployment import inventory, netcheck
+
+    vm = SimpleNamespace(_moId="vm-1")
+    nic = SimpleNamespace(network="VM-LAN", ipAddress=["192.0.2.40"], ipConfig=None)
+
+    def fake_collect(conn, kind, paths, root=None, strict=False):
+        # the read of the VMs' addresses (not tested by "guest.net": code scanning took it for a web domain)
+        if "runtime.powerState" in paths:
+            return [(vm, {"name": "App%2fDB 100%25", "guest.net": [nic], "runtime.host": None,
+                          "runtime.powerState": "poweredOn"})]
+        if "config.network.vnic" in paths:
+            return []
+        return [(vm, {"name": "App%2fDB 100%25"})]
+
+    monkeypatch.setattr(inventory, "collect", fake_collect)
+    blockers, _ = netcheck.find_conflicts(netcheck.ip_uses(None), "192.0.2.40/24", "VM-LAN")
+    assert "VM 'App/DB 100%'" in blockers[0]
+    assert [p["name"] for _v, p in inventory.vm_properties(None, ["name"])] == ["App/DB 100%"]
+    assert inventory.find_vm_with(None, "App/DB 100%") is not None

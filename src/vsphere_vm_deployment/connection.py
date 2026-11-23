@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import ssl
+import threading
 from dataclasses import dataclass, field
 
 from pyVim import connect as pyvim_connect
@@ -109,6 +110,88 @@ def _raw_connect(profile: Profile, decision: TrustDecision, *, user: str | None 
         if (failed := certificate_failure(e)) is None:
             raise
         raise decision.refused(failed, "sign-in") from e
+
+
+def clone_session(conn: Connection) -> Connection:
+    """A second, independent session for the same signed-in user (pyVmomi connections are not safe to share between
+    threads; a batch builds each VM over its own). vSphere's clone ticket makes it without a password, so it works
+    for password and federated sign-in alike, and it goes through the same pinned certificate. Close it like any
+    connection (it logs out)."""
+    from pyVmomi import SoapStubAdapter
+
+    ticket = conn.content.sessionManager.AcquireCloneTicket()
+    register_secret(ticket)  # a one-time, short-lived ticket: still never logged
+    stub = SoapStubAdapter(host=conn.profile.host, port=conn.profile.port, path="/sdk",
+                           version=conn.si._stub.version,  # noqa: SLF001 - the API version already negotiated
+                           sslContext=conn.decision.ssl_context())
+    si = vim.ServiceInstance("ServiceInstance", stub)
+    try:
+        si.RetrieveContent().sessionManager.CloneSession(cloneTicket=ticket)
+    except (ssl.SSLCertVerificationError, vim.fault.HostConnectFault) as e:
+        if (failed := certificate_failure(e)) is None:
+            raise
+        raise conn.decision.refused(failed, "sign-in") from e
+    return Connection(si=si, profile=conn.profile, decision=conn.decision, trust=conn.trust, user=conn.user,
+                      managed_by=conn.managed_by)
+
+
+_session_lock = threading.Lock()
+
+
+def ensure_session(conn: Connection, prompter: Prompter | None = None) -> bool:
+    """Sign in again when vCenter or ESXi has ended the session: it does after it has been idle for a while (30
+    minutes by default), e.g. while a review waits for an answer. Returns True when it signed in again. It signs in
+    over the same connection, so the objects already read (hosts, datastores, folders) keep working.
+
+    With an interactive prompter (a person just confirmed a review), the password is asked again: whoever is at
+    the keyboard must know it, so a terminal left open cannot deploy on its own. Without one (a `--yes` run, or
+    between the VMs of a batch already confirmed) the password given at the start is used (held in memory only).
+    A federated sign-in cannot be renewed over the same connection: AuthError then. Safe to call from several
+    threads."""
+    with _session_lock:
+        try:
+            if conn.content.sessionManager.currentSession is not None:
+                return False
+        except vim.fault.NotAuthenticated:
+            pass
+        expired = f"The session with {conn.profile.endpoint} expired (it was idle too long)"
+        if not conn.rest_credentials:
+            raise AuthError(f"{expired}, and a federated sign-in cannot be renewed here.",
+                            hint="Run the command again, and answer within the server's idle timeout (30 minutes "
+                                 "by default).")
+        user, pwd = conn.rest_credentials
+        if prompter is not None and prompter.interactive:
+            _sign_in_again(conn, prompter, user)
+            return True
+        try:
+            conn.content.sessionManager.Login(userName=user, password=pwd)
+        except vim.fault.InvalidLogin:
+            raise AuthError(f"{expired}, and signing in again as {user} failed (was the password changed?).",
+                            hint="Run the command again.") from None
+        log.info("The session had expired; signed in again as %s", user)
+        return True
+
+
+def _sign_in_again(conn: Connection, prompter: Prompter, user: str, attempts: int = 3) -> None:
+    """Ask for the password again (never the one kept from the start), over the same connection."""
+    with prompter.section("Sign in again"):
+        warn(f"The session with {conn.profile.endpoint} ended while waiting for your answer (vCenter and ESXi end "
+             "idle sessions). Nothing has been changed. Type the password to go ahead, or press Ctrl+C to cancel.")
+        for attempt in range(1, attempts + 1):
+            pwd = prompter.password(f"Password for {user}:")
+            register_secret(pwd)
+            try:
+                conn.content.sessionManager.Login(userName=user, password=pwd)
+            except vim.fault.InvalidLogin:
+                if attempt < attempts:
+                    warn("Incorrect password, try again.")
+                    continue
+                raise AuthError(f"Signing in again as {user} failed. Nothing was changed.",
+                                hint="Run the command again.") from None
+            conn.rest_credentials = (user, pwd)
+            prompter.record("Signed in again as", user)
+            log.info("The session had expired; signed in again as %s (password typed again)", user)
+            return
 
 
 ENV_SECRETS = {"password": "VMDEPLOY_PASSWORD", "client_secret": "VMDEPLOY_CLIENT_SECRET"}

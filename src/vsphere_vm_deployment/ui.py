@@ -14,6 +14,7 @@ Design:
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import inspect
 import logging
 import sys
@@ -41,7 +42,7 @@ from rich.table import Table
 from rich.text import Text
 
 from .errors import MissingInput, UserAborted
-from .logsetup import FILE_ONLY
+from .logsetup import FILE_ONLY, safe_url
 from .units import human_size, size_unit
 
 log = logging.getLogger(__name__)
@@ -148,10 +149,13 @@ class DeploymentView:
         self._overall_task = self._overall.add_task("overall", total=100)
 
     # ----------------------------------------------------------------- lifecycle
+    def _new_live(self) -> Live:
+        return Live(get_renderable=self._render, console=console, refresh_per_second=8,
+                    transient=True, redirect_stderr=False, redirect_stdout=False)
+
     def __enter__(self) -> DeploymentView:
         if self.enabled:
-            self._live = Live(get_renderable=self._render, console=console, refresh_per_second=8,
-                              transient=True, redirect_stderr=False, redirect_stdout=False)
+            self._live = self._new_live()
             self._live.start()
         return self
 
@@ -178,7 +182,11 @@ class DeploymentView:
         finally:
             self._pause_depth -= 1
             if live and self._pause_depth == 0 and self._live is live:
-                live.start()
+                # A new Live, not live.start(): a restarted Live still remembers the height it had before it was
+                # stopped and moves the cursor up that far on its first refresh, erasing the last lines printed
+                # while it was paused (the review screen lost all but its first lines).
+                self._live = self._new_live()
+                self._live.start()
 
     @contextlib.contextmanager
     def waiting(self) -> Iterator[None]:
@@ -350,6 +358,79 @@ class DeploymentView:
 
 
 # --------------------------------------------------------------------------- prompts
+YES, NO = ("yes", "y"), ("no", "n")
+
+
+def yes_no_error(text: str) -> bool | str:
+    """True for an answer to a yes/no question; otherwise what to type."""
+    return text.strip().lower() in YES + NO or "Answer yes or no (y/n), or press Ctrl+C to cancel."
+
+
+# A checklist longer than this asks for a name pattern first and lists only the matches, so `a` (select all) takes
+# what is listed. questionary's own type-to-filter is not used for checklists: its select-all also takes the
+# entries the filter hides (an access setup could grant every datastore while the screen showed eight).
+FILTER_AT = 12
+
+
+def matches(label: str, pattern: str) -> bool:
+    """A choice's label against a typed filter (case does not matter): shell-style with *, ? or [...], otherwise
+    text the label contains. The name alone (the label before its details, e.g. a host's "  (16 cores)") is tried
+    too, so 'esx*' and '*01' both work."""
+    label, pattern = label.lower(), pattern.strip().lower()
+    if not any(ch in pattern for ch in "*?["):
+        return pattern in label
+    return fnmatch.fnmatchcase(label, pattern) or fnmatch.fnmatchcase(label.split("  ")[0], pattern)
+
+# Answers a retry never takes from the run it retries: a licence is accepted each time, and "_" fields are
+# internal markers. Passwords are never kept at all, nor a URL holding a password or token (_hides_secret); the
+# review is never answered for the user (no field name).
+NOT_REPLAYED = ("ovf.accept_eula",)
+_NO_FIT = object()
+
+
+def to_json(value: Any) -> Any:
+    """An answer as saved in a results file: plain values as they are, an inventory object by its name (a host,
+    datastore, ...). Raises TypeError for anything else (not saved; the question is asked again)."""
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    if isinstance(value, list | tuple):
+        return [to_json(v) for v in value]
+    name = getattr(value, "name", None)
+    if isinstance(name, str):
+        return {"name": name}
+    raise TypeError(f"not saved: {type(value).__name__}")
+
+
+def _hides_secret(value: Any) -> bool:
+    """An answer holding a URL with a password or token in it (user:password@, or a query string such as a
+    pre-signed signature), e.g. a URL typed at "Where is the VM image?": never saved, as in the logs, so a retry
+    asks for it again. Text without an http(s) URL is never affected (a key's user@host, an e-mail address)."""
+    if isinstance(value, str):
+        return safe_url(value) != value
+    if isinstance(value, list | tuple):
+        return any(_hides_secret(v) for v in value)
+    return False
+
+
+def saved_answers(answers: dict[str, Any]) -> dict[str, Any]:
+    out = {}
+    for k, v in answers.items():
+        if k.startswith(("_", "--")) or k in NOT_REPLAYED or _hides_secret(v):
+            continue
+        try:
+            out[k] = to_json(v)
+        except TypeError:
+            continue
+    return out
+
+
+def _same(value: Any, saved: Any) -> bool:
+    try:
+        return value == saved or to_json(value) == saved
+    except TypeError:
+        return False
+
+
 class Prompter:
     """Interactive questions with a non-interactive mode for `--yes` / CI usage."""
 
@@ -360,10 +441,34 @@ class Prompter:
         # Answers by field name, so "Change my answers" can offer each previous answer as the default.
         self.answers: dict[str, Any] = {}
         self.previous: dict[str, Any] = {}
+        # A retry's answers from the run it retries (`deploy --batch --retry-failed`): each question they still fit
+        # is answered with them, shown, and not asked; "Change my answers" asks everything again.
+        self.replay: dict[str, Any] = {}
+
+    def would_ask(self, field_name: str) -> bool:
+        """Is this question answered by someone: a person, or the run a retry repeats? Otherwise a default is
+        taken where one is sensible (--yes)."""
+        return self.interactive or field_name in self.replay
 
     def start_revision(self) -> None:
         """Ask the questions again with this pass's answers as the defaults."""
-        self.previous, self.answers = dict(self.answers), {}
+        self.previous, self.answers, self.replay = dict(self.answers), {}, {}
+
+    def _replayed(self, field_name: str, question: str, fit: Callable[[Any], Any], shown=None) -> Any:
+        """The answer the retried run gave, if it still fits (`fit` returns the value to use, or _NO_FIT);
+        otherwise _NO_FIT and the question is asked."""
+        if not field_name or field_name not in self.replay or field_name in NOT_REPLAYED:
+            return _NO_FIT
+        try:
+            value = fit(self.replay[field_name])
+        except (TypeError, ValueError, KeyError):
+            return _NO_FIT
+        if value is not _NO_FIT:
+            text = shown(value) if shown else ("yes" if value is True else "no" if value is False else str(value))
+            console.print(Text("  ✔ ", style="green") + Text(f"{question.rstrip(':?')}: ", style="bold")
+                          + Text(text) + Text("  (as in the first run)", style="dim"))
+            self._keep(field_name, value)
+        return value
 
     def _prev(self, field_name: str, default: Any) -> Any:
         return self.previous.get(field_name, default) if field_name else default
@@ -414,6 +519,13 @@ class Prompter:
     def text(self, question: str, *, default: str | None = None, field_name: str = "",
              validate: Callable[[str], bool | str] | None = None, assume_default: bool = False,
              secret: bool = False) -> str:
+        if not secret:
+            def fit(v):
+                v = str(v) if isinstance(v, int | float) and not isinstance(v, bool) else v  # a saved number
+                return v if isinstance(v, str) and (validate is None or validate(v) is True) else _NO_FIT
+            got = self._replayed(field_name, question, fit)
+            if got is not _NO_FIT:
+                return got
         if not self.interactive:
             if default is not None and assume_default:
                 return default
@@ -429,23 +541,48 @@ class Prompter:
     def confirm(self, question: str, *, default: bool = False, field_name: str = "",
                 assume: bool | None = None) -> bool:
         """`assume` is what non-interactive mode answers; None means non-interactive must fail."""
+        got = self._replayed(field_name, question, lambda v: v if isinstance(v, bool) else _NO_FIT)
+        if got is not _NO_FIT:
+            return got
         if not self.interactive:
             if assume is None:
                 self._need(field_name, question)
             return bool(assume)
+        # Typed, never a single keypress: questionary's confirm took the first y/n anywhere in stray typing and
+        # Enter took the default, so a question could be answered by accident. Only yes/y/no/n are accepted.
         default = bool(self._prev(field_name, default))
-        return self._keep(field_name, bool(self._ask(questionary.confirm(question, default=default))))
+        shown = f"{question} (yes/no, {'before' if field_name in self.previous else 'suggested'}: "                 f"{'yes' if default else 'no'})"
+        answer = self._ask(questionary.text(shown, validate=yes_no_error))
+        return self._keep(field_name, answer.strip().lower() in YES)
 
     def select(self, question: str, choices: Sequence[tuple], *, default: Any = None,
-               field_name: str = "", assume_default: bool = False, auto_single: bool = True) -> Any:
+               field_name: str = "", assume_default: bool = False, auto_single: bool = True,
+               answer_key: str = "") -> Any:
         """`choices` is a list of (label, value) or (label, value, description). Returns the value. A description
         is shown below the list for the highlighted choice only (long vendor texts no longer run off the screen).
         When there is exactly one possible answer (e.g. a host with a single datastore) it is taken without
-        asking, unless auto_single=False."""
+        asking, unless auto_single=False.
+
+        `answer_key`: what the answer is kept, offered again and replayed under, when that is not `field_name`
+        alone: several questions answered by one manifest field (each host's datastore, all of them from
+        batch.targets[k].datastore) or a question that is not the field itself (how hostnames are chosen, before
+        the batch.hostname pattern). `field_name` still names the manifest field a --yes run needs."""
         if not choices:
             raise MissingInput(f"No valid options available for: {question}")
         if len(choices) == 1 and auto_single:
             return choices[0][1]
+        key = answer_key or field_name
+        match = {}
+
+        def fit(saved):
+            hit = next((c for c in choices if _same(c[1], saved)), None)
+            if hit is None:
+                return _NO_FIT
+            match["label"] = hit[0]
+            return hit[1]
+        got = self._replayed(key, question, fit, shown=lambda v: match["label"])
+        if got is not _NO_FIT:
+            return got
         if not self.interactive:
             if assume_default and default is not None:
                 return default
@@ -457,30 +594,64 @@ class Prompter:
             desc = c[2] if len(c) > 2 and c[2] else None
             qchoices.append(questionary.Choice(title=c[0], value=c[1], description=desc)
                             if desc and _CHOICE_DESCRIPTIONS else questionary.Choice(title=c[0], value=c[1]))
-        default = self._prev(field_name, default)
+        default = self._prev(key, default)
         default_choice = next((c for c in qchoices if c.value == default), None)
-        return self._keep(field_name, self._ask(questionary.select(
+        return self._keep(key, self._ask(questionary.select(
             question, choices=qchoices, default=default_choice, use_search_filter=len(qchoices) > 12,
             use_jk_keys=False)))
 
-    def checkbox(self, question: str, choices: Sequence[tuple[str, Any]], *, field_name: str = "",
+    def checkbox(self, question: str, choices: Sequence[tuple], *, field_name: str = "",
                  minimum: int = 1) -> list[Any]:
         """Pick one or more of (label, value) (or none, with minimum=0). A single required choice is taken
-        without asking."""
-        if not choices:
+        without asking. A third element, when set, greys the choice out with that reason (e.g. "maintenance mode"):
+        shown, so the user knows why it cannot be picked. A list longer than FILTER_AT asks for a name pattern
+        first and lists only the matches (a retry's saved answer is tried against the whole list before that)."""
+        usable = [c for c in choices if not (len(c) > 2 and c[2])]
+        if not usable:
             if minimum == 0:
                 return []
             raise MissingInput(f"No valid options available for: {question}")
-        if len(choices) == 1 and minimum >= 1:
-            return [choices[0][1]]
+        if len(usable) == 1 and len(choices) == 1 and minimum >= 1:
+            return [usable[0][1]]
+        labels = {}
+
+        def fit(saved):
+            picked = [next((c for c in usable if _same(c[1], v)), None) for v in saved]
+            if not isinstance(saved, list) or None in picked or len(picked) < minimum:
+                return _NO_FIT  # e.g. a host that is gone or in maintenance mode now: asked again
+            labels["text"] = ", ".join(c[0].split("  ")[0] for c in picked)  # the name, not its free space
+            return [c[1] for c in picked]
+        got = self._replayed(field_name, question, fit, shown=lambda v: labels["text"])
+        if got is not _NO_FIT:
+            return got
         if not self.interactive and minimum == 0:
             return []
         if not self.interactive:
             self._need(field_name, question)
-        qchoices = [questionary.Choice(title=label, value=value) for label, value in choices]
-        return self._ask(questionary.checkbox(
-            question, choices=qchoices,
-            validate=lambda picked: len(picked) >= minimum or f"Pick at least {minimum} (space to select)"))
+        listed = self._narrowed(question, choices) if len(choices) > FILTER_AT else list(choices)
+        qchoices = [questionary.Choice(title=c[0], value=c[1], disabled=c[2] if len(c) > 2 and c[2] else None)
+                    for c in listed]
+        # Say how to pick many at once (large vCenters list dozens of hosts or datastores): questionary has the
+        # keys, but its own hint was replaced by ours. `a` takes every entry listed, and only those.
+        return self._keep(field_name, self._ask(questionary.checkbox(
+            question, choices=qchoices, instruction="(space selects, a selects all listed, i inverts, Enter confirms)",
+            validate=lambda picked: len(picked) >= minimum or f"Pick at least {minimum} (space selects, a selects "
+                                                              "all listed)")))
+
+    def _narrowed(self, question: str, choices: Sequence[tuple]) -> list[tuple]:
+        """The entries of a long checklist that match a pattern typed first (Enter: all of them). A pattern that
+        leaves nothing to pick is asked again."""
+        what = question.rstrip(":?").strip()
+        while True:
+            pattern = self._ask(questionary.text(f"{what}: {len(choices)} to choose from. Only list those matching "
+                                                 "(e.g. esx-east-* or nvme; Enter lists all):")).strip()
+            if pattern in ("", "*"):
+                return list(choices)
+            listed = [c for c in choices if matches(c[0], pattern)]
+            if any(not (len(c) > 2 and c[2]) for c in listed):
+                return listed
+            console.print(Text(f"  Nothing that can be picked matches '{pattern}': try another, or press Enter to "
+                               "list all.", style="yellow"))
 
     def numbered(self, question: str, choices: Sequence[tuple[str, Any]], *, default: Any,
                  field_name: str = "") -> Any:
@@ -520,8 +691,6 @@ class Prompter:
                 return f"Must be at most {maximum}"
             return True
 
-        if not self.interactive:
-            self._need(field_name, question)
         return int(self.text(question, default=str(default) if default is not None else None,
                              validate=_validate, field_name=field_name))
 

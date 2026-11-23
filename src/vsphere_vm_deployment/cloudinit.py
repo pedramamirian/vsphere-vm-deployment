@@ -24,7 +24,7 @@ import uuid
 
 import yaml
 
-from .manifest import GuestSpec
+from .manifest import GuestNetwork, GuestSpec
 
 # ------------------------------------------------------------------------------------------- SHA-512 crypt
 _B64 = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -84,12 +84,15 @@ def sha512_crypt(password: str, salt: str | None = None, rounds: int = 5000) -> 
 
 
 # ------------------------------------------------------------------------------------------- rendering
-def _netplan(net, mac: str | None = None) -> dict:
+def _netplan(net, mac: str | None = None, dhcp_identifier: str = "image") -> dict:
     """netplan for the guest. Matched by `mac` (NIC 1's address) when given: with `en*`, netplan applies the
     settings to every adapter, so a VM with several NICs would get the same static address and default route on
-    each. Without a MAC (one NIC, or DHCP) `en*` is right."""
+    each. Without a MAC (one NIC, or DHCP) `en*` is right. `dhcp_identifier` "mac": the DHCP client identifies
+    itself by the MAC address instead of netplan's default DUID (which DHCP reservations by MAC do not match)."""
     match = {"macaddress": mac.lower()} if mac else {"name": "en*"}
     eth: dict = {"match": match, "dhcp4": net.mode == "dhcp"}
+    if net.mode == "dhcp" and dhcp_identifier == "mac":
+        eth["dhcp-identifier"] = "mac"
     if net.mode == "static":
         eth["addresses"] = [str(ipaddress.ip_interface(net.address))]
         if net.gateway:
@@ -104,10 +107,12 @@ def _netplan(net, mac: str | None = None) -> dict:
     return {"version": 2, "ethernets": {"primary": eth}}
 
 
-def render_user_data(guest: GuestSpec, hostname: str, *, network_in_userdata: bool, mac: str | None = None) -> str:
+def render_user_data(guest: GuestSpec, hostname: str | None, *, network_in_userdata: bool,
+                     mac: str | None = None) -> str:
     """Build #cloud-config. `network_in_userdata` writes a netplan file at first boot (OVF datasource,
-    which cannot carry network-config); otherwise network goes into guestinfo metadata."""
-    cfg: dict = {"hostname": hostname, "preserve_hostname": False, "manage_etc_hosts": True}
+    which cannot carry network-config); otherwise network goes into guestinfo metadata. Without a hostname (a batch
+    that leaves it to the image) the image keeps its own."""
+    cfg: dict = {"hostname": hostname, "preserve_hostname": False, "manage_etc_hosts": True} if hostname else {}
     if guest.username:
         user: dict = {"name": guest.username, "groups": ["sudo"], "shell": "/bin/bash",
                       "lock_passwd": not bool(guest.password_hash)}
@@ -134,14 +139,43 @@ def render_user_data(guest: GuestSpec, hostname: str, *, network_in_userdata: bo
     return "#cloud-config\n" + yaml.safe_dump(cfg, sort_keys=False, default_flow_style=False)
 
 
-def render_metadata(hostname: str, guest: GuestSpec, mac: str | None = None) -> str:
-    md: dict = {"instance-id": f"vmdeploy-{uuid.uuid4()}", "local-hostname": hostname,
-                # Remove secrets from the VM's guestinfo once cloud-init has read them (cloud-init docs:
-                # 'redact', formerly 'cleanup-guestinfo').
-                "redact": ["userdata", "vendordata"]}
+def guest_network(guest: GuestSpec) -> GuestNetwork | None:
+    """The network settings to write: the guest's own, or DHCP when only the DHCP identifier needs setting (no
+    network chosen means DHCP, the image's default). None: write nothing, the image's default stays."""
     if guest.network:
-        md["network"] = _netplan(guest.network, mac)
+        return guest.network
+    return GuestNetwork(mode="dhcp") if guest.dhcp_identifier == "mac" else None
+
+
+def sets_dhcp_identifier(guest: GuestSpec | None) -> bool:
+    net = guest_network(guest) if guest else None
+    return bool(net and net.mode == "dhcp" and guest.dhcp_identifier == "mac")
+
+
+def render_metadata(hostname: str | None, guest: GuestSpec, mac: str | None = None) -> str:
+    md: dict = {"instance-id": f"vmdeploy-{uuid.uuid4()}"}
+    if hostname:
+        md["local-hostname"] = hostname
+    # Remove secrets from the VM's guestinfo once cloud-init has read them (cloud-init docs: 'redact', formerly
+    # 'cleanup-guestinfo').
+    md["redact"] = ["userdata", "vendordata"]
+    net = guest_network(guest)
+    if net:
+        md["network"] = _netplan(net, mac, guest.dhcp_identifier)
     return yaml.safe_dump(md, sort_keys=False)
+
+
+OVF_NETWORK_CONFIG = "network-config"  # the OVF property cloud-init's OVF datasource reads network settings from
+
+
+def ovf_network_config(guest: GuestSpec, mac: str | None) -> str | None:
+    """The `network-config` OVF property value (base64 YAML) for DHCP with the MAC as identifier, or None. cloud-init
+    applies it before the network starts; settings written by user-data come too late: the guest would already
+    have asked for an address the image's way. Static addresses still go through user-data (tested route)."""
+    if not sets_dhcp_identifier(guest):
+        return None
+    doc = {"network": _netplan(guest_network(guest), mac, guest.dhcp_identifier)}
+    return base64.b64encode(yaml.safe_dump(doc, sort_keys=False).encode()).decode()
 
 
 def gzip_b64(text: str) -> str:
@@ -157,13 +191,13 @@ def guestinfo_extra_config(user_data: str, metadata: str) -> dict[str, str]:
     }
 
 
-def ovf_property_values(available_keys: set[str], user_data: str, hostname: str) -> dict[str, str]:
-    """Values for Ubuntu-style OVF properties (user-data is base64 encoded to fit an XML attribute)."""
-    want = {
-        "user-data": base64.b64encode(user_data.encode()).decode(),
-        "hostname": hostname,
-        "instance-id": f"vmdeploy-{uuid.uuid4()}",
-    }
+def ovf_property_values(available_keys: set[str], user_data: str, hostname: str | None) -> dict[str, str]:
+    """Values for Ubuntu-style OVF properties (user-data is base64 encoded to fit an XML attribute). Without a
+    hostname the image's own default stays."""
+    want = {"user-data": base64.b64encode(user_data.encode()).decode()}
+    if hostname:
+        want["hostname"] = hostname
+    want["instance-id"] = f"vmdeploy-{uuid.uuid4()}"
     out = {}
     for full_key in available_keys:
         short = full_key.split(".")[-1] if full_key not in want else full_key

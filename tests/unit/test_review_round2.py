@@ -126,7 +126,7 @@ def test_the_second_vm_name_is_checked_like_the_first():
         checks[question] = validate
         return "web02" if question.startswith("Choose") else "web01"
 
-    fake = NS(p=NS(text=text, interactive=True, record=lambda *a: None), m=NS(vm=NS(name=None)), pkg=None,
+    fake = NS(p=NS(text=text, interactive=True, record=lambda *a: None), m=NS(vm=NS(name=None)), pkg=None, image=None,
               o=NS(replace=False))
     assert d.Deployment._ask_name(fake, NS(vm_names={"web01"}, name="DC")) == "web02"
     again = checks["Choose another VM name:"]
@@ -379,6 +379,8 @@ def test_extra_disks_get_the_vms_provisioning_unless_they_name_their_own():
     fake = NS(p=NS(record=lambda *a: None, select=lambda *a, **k: pytest.fail("asked")), appliance=None,
               m=NS(placement=NS(datastore="ds1"), resources=NS(disk_provisioning=Provisioning.EAGER)),
               pkg=None, image=NS(is_iso=False), _needed_bytes=lambda plan: 50 * gib)
+    fake._ask_provisioning = lambda: d.Deployment._ask_provisioning(fake)
+    fake._space_needed = lambda plan: d.Deployment._space_needed(fake, plan)
     d.Deployment._ask_datastore(fake, plan)
     assert plan.extra_disks == [(80, Provisioning.EAGER), (5, Provisioning.THIN)]
     # A thin VM with an 80 GB eager-zeroed extra disk: that disk takes its full size at once (50 + 80 > 100 GB).
