@@ -27,6 +27,12 @@ def _logs(*args):
     return CliRunner().invoke(app, ["logs", *args])
 
 
+def _flat(text: str) -> str:
+    """Output as one line: Rich wraps long lines, and where depends on the length of the temporary paths in them
+    (which differs by operating system), so a phrase can be split across two lines."""
+    return " ".join(text.split())
+
+
 def _batch(folder, stamp, deployed=2, total=2, dc="DC1"):
     vms = [{"name": f"vm-{i}", "status": "deployed" if i < deployed else "failed"} for i in range(total)]
     f = folder / f"batch-{stamp}.json"
@@ -85,7 +91,7 @@ def test_an_unreachable_folder_falls_back_and_says_so(no_override, isolated_dirs
     assert "not available" in paths.log_dir_problem() and str(missing) in paths.log_dir_problem()
     assert not missing.parent.exists()  # a missing drive or share is never created locally
     r = CliRunner().invoke(app, ["logs"])
-    assert "not available" in r.output
+    assert "not available" in _flat(r.output)
 
 
 def test_a_deleted_chosen_folder_is_created_again(no_override, isolated_dirs):

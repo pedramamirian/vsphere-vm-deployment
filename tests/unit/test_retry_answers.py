@@ -202,18 +202,23 @@ def test_a_retry_refuses_what_its_results_file_cannot_give(tmp_path):
 
     from vsphere_vm_deployment.cli import app
 
+    def said(result) -> str:
+        """The output as one line. Without a terminal Rich wraps at 80 columns, and where a line breaks depends on
+        the temporary folder's path: on Linux CI it broke inside "is not there any more"."""
+        return " ".join(result.output.split())
+
     f = tmp_path / "batch-20261122-101500.json"
     f.write_text(json.dumps({"batch": True, "vms": [{"name": "a", "status": "failed"}],
                              "manifest": str(tmp_path / "moved.yaml")}))
     r = CliRunner().invoke(app, ["deploy", "--retry-failed", str(f), "--yes"])
-    assert r.exit_code == 2 and "is not there any more" in r.output and "Give it with -f" in r.output
+    assert r.exit_code == 2 and "is not there any more" in said(r) and "Give it with -f" in said(r)
     f.write_text(json.dumps({"batch": True, "vms": [{"name": "a", "status": "failed"}],
                              "source": {"kind": "url", "value": "https://***@files.example.test/web.ova",
                                         "sha256": None, "redacted": True}}))
     r = CliRunner().invoke(app, ["deploy", "--retry-failed", str(f), "--yes"])
-    assert r.exit_code == 2 and "held a password or token" in r.output and "--url" in r.output
+    assert r.exit_code == 2 and "held a password or token" in said(r) and "--url" in said(r)
     r = CliRunner().invoke(app, ["deploy", "--retry-failed", str(f)])  # interactive: the image is asked again
-    assert "choose the image again" in r.output and "Give it again with --url" not in r.output
+    assert "choose the image again" in said(r) and "Give it again with --url" not in said(r)
 
 
 def test_each_hosts_datastore_is_kept_and_reused_for_that_host(monkeypatch):
