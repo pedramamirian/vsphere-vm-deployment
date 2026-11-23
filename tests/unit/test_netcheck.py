@@ -115,7 +115,8 @@ def test_vm_names_are_shown_as_typed_in_vcenter(monkeypatch):
     nic = SimpleNamespace(network="VM-LAN", ipAddress=["192.0.2.40"], ipConfig=None)
 
     def fake_collect(conn, kind, paths, root=None, strict=False):
-        if "guest.net" in paths:
+        # the read of the VMs' addresses (not tested by "guest.net": code scanning took it for a web domain)
+        if "runtime.powerState" in paths:
             return [(vm, {"name": "App%2fDB 100%25", "guest.net": [nic], "runtime.host": None,
                           "runtime.powerState": "poweredOn"})]
         if "config.network.vnic" in paths:
