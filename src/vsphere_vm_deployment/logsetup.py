@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from datetime import datetime
 from pathlib import Path
 
-from .paths import log_dir
+from .paths import fallback_log_dir, log_dir
 
 _PATTERNS = [
     # key=value / "key": "value" style secrets
@@ -52,12 +53,24 @@ def redact(text: str) -> str:
     return safe_url(text)
 
 
+_context = threading.local()
+
+
+def set_log_label(label: str | None) -> None:
+    """Prefix this thread's log lines with `label` (a batch names the VM each line is about), or stop (None)."""
+    _context.label = label
+
+
 class RedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             msg = record.getMessage()
         except Exception:  # noqa: BLE001 - never let logging crash the tool
             msg = str(record.msg)
+        label = getattr(_context, "label", None)
+        if label and not getattr(record, "vmdeploy_labelled", False):  # each handler filters the same record
+            msg = f"[{label}] {msg}"
+            record.vmdeploy_labelled = True
         record.msg = redact(msg)
         record.args = ()
         return True
@@ -97,7 +110,13 @@ def setup_logging(verbose: int = 0) -> Path:
     root.handlers.clear()
     root.setLevel(logging.DEBUG)
 
-    fh = logging.FileHandler(_log_file, encoding="utf-8")
+    try:
+        fh = logging.FileHandler(_log_file, encoding="utf-8")
+    except OSError as e:  # a chosen folder that exists but cannot be written to: the run still gets a log
+        folder = _log_file.parent
+        _log_file = fallback_log_dir(f"Cannot write to the log folder {folder} ({e.strerror or e}); using the "
+                                     "default folder this time.") / f"vmdeploy-{stamp}.log"
+        fh = logging.FileHandler(_log_file, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(RedactingFormatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
     fh.addFilter(RedactingFilter())

@@ -8,7 +8,7 @@ the tool signs in, reads your environment, asks only for what it cannot work out
 plan, and then deploys with live progress bars.
 
 ```
-╭─ vsphere-vm-deployment 0.1.0 ─────────────────────────────────────────────────────────────╮
+╭─ vsphere-vm-deployment 0.2.0 ─────────────────────────────────────────────────────────────╮
 │ ✔  Connect and sign in        VMware vCenter Server 8.0.3 as svc-deploy@vsphere.local      │
 │ ✔  Discover inventory          Lab: 3 host(s), 4 datastore(s), 6 network(s)                │
 │ ✔  Acquire and verify image    Ubuntu 24.04 LTS (noble) build 20261001  [OVA]              │
@@ -27,9 +27,14 @@ plan, and then deploys with live progress bars.
 ╰────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-> **Status: alpha (0.1.0).** Tested against real vCenter Server 8.0.3 and ESXi 8.0.3 environments (through
-> vCenter and directly to a host), and covered end to end by automated tests against VMware's `vcsim`
-> simulator, including the vSphere 9.0 API. A few features are so far tested with the simulator only (see
+> **Status: alpha, in active development (0.2.0).** New in 0.2.0:
+> [deploying several VMs at once](#deploying-several-vms-at-once-batch), with one review for the whole batch,
+> retries of the VMs that failed and deleting a whole batch again. Every release is listed in the
+> [changelog](CHANGELOG.md), and what is planned next in [Known limitations and roadmap](#known-limitations-and-roadmap).
+>
+> Tested against real vCenter Server 8.0.3 and ESXi 8.0.3 environments (through vCenter and directly to a
+> host), and covered end to end by automated tests against VMware's `vcsim` simulator, including the vSphere
+> 9.0 API. A few features are so far tested with the simulator only (see
 > [Known limitations](#known-limitations-and-roadmap)). Please report anything that does not work in your
 > environment ([Reporting problems](#reporting-problems)).
 
@@ -80,6 +85,7 @@ task and command on one page. Every command is explained with examples in the [C
 | **vSphere** | vCenter Server and ESXi 8.0 and 9.x, deploying through vCenter or directly to a standalone host | vSphere 7.x and older |
 | **Licences** | vSphere with a paid, VMUG Advantage or evaluation licence. Your own licences for Windows (your ISO, then a product key or KMS) and for vendor appliances (their licence agreement is shown and must be accepted). vmdeploy itself is free and open source (Apache 2.0) | Free ESXi (the "vSphere Hypervisor" licence makes the API read-only) |
 | **Images** | OVA, OVF (with its disk files) and ISO: from your computer, a download link (OVA or ISO), the Ubuntu Server presets, or a datastore | Cloning existing VMs or templates; Content Library items (planned); multi-VM OVF packages (vApps) |
+| **Several VMs at once** | A [batch](#deploying-several-vms-at-once-batch): one image with the same settings to many hosts, DRS clusters or resource pools and their datastores, built in parallel, through one vCenter or on one ESXi host | Several vCenters or standalone hosts in one batch (planned); deploying once and cloning the rest (to explore) |
 | **Guests** | Any operating system installed from its ISO in the VM console; first-boot settings through cloud-init for images that support it (e.g. Ubuntu cloud images); Windows 10, 11 and Server 2016 to 2025 with the virtual hardware Windows Setup needs; vendor appliances with their sizes, settings and licence agreements | Unattended installs from an ISO (planned); Windows guest customisation (sysprep) |
 | **Networks and storage** | Standard and distributed portgroups, NSX segments; local, shared (NFS, iSCSI, FC) and vSAN datastores | Choosing a vSAN storage policy (the datastore's default is used); first-boot network settings beyond the first network adapter |
 | **Virtual TPM (Windows 11)** | Through vCenter, with a key provider, on a host in a cluster ([details](#virtual-tpm-where-it-works)) | An ESXi host without vCenter; a host outside a cluster |
@@ -221,7 +227,7 @@ pip install -e .
 vmdeploy --version
 ```
 
-You should see `vsphere-vm-deployment 0.1.0`. This installs the `vmdeploy` command (also available as
+You should see `vsphere-vm-deployment 0.2.0`. This installs the `vmdeploy` command (also available as
 `vsphere-vm-deploy`).
 
 With option B, the `vmdeploy` command only exists while the virtual environment is **activated** (your prompt
@@ -323,6 +329,10 @@ Everything you need when you come back to vmdeploy after a while. Each command i
 | Deploy from a download link | `vmdeploy deploy --url URL --sha256 HASH` |
 | Deploy an ISO or OVA that is already on a datastore | `vmdeploy deploy --datastore-file "[datastore] folder/file.iso"` |
 | Repeat a deployment from saved answers | `vmdeploy deploy -f my-vm.yaml` (add `--yes` for no questions at all) |
+| Deploy the same image to several hosts at once | `vmdeploy deploy --batch` (or `-f batch.yaml` with a `batch:` section) |
+| Deploy again the VMs of a batch that did not deploy | `vmdeploy deploy --retry-failed latest` |
+| Delete every VM a batch deployed | `vmdeploy destroy --batch latest` (or the results file's name) |
+| Find logs and batch results files, or keep them somewhere else | `vmdeploy logs`, `vmdeploy logs --folder PATH` |
 | List, or delete, the VMs this tool deployed | `vmdeploy list`, `vmdeploy destroy NAME` |
 | Create a restricted, deploy-only account | `vmdeploy access setup` (as an administrator) |
 | Check what vmdeploy left in vCenter or ESXi | `vmdeploy access audit` |
@@ -565,7 +575,8 @@ they will do.
 | [`inventory`](#vmdeploy-inventory) | Show datacenters, clusters, hosts, datastores and networks | Nothing (read-only) |
 | [`list`](#vmdeploy-list) | List the VMs vmdeploy deployed | Nothing (read-only) |
 | [`deploy`](#vmdeploy-deploy) | Deploy a VM from an OVA, OVF or ISO | vSphere, after you confirm the plan |
-| [`destroy`](#vmdeploy-destroy) | Power off and delete a VM vmdeploy deployed | vSphere, after you confirm |
+| [`destroy`](#vmdeploy-destroy) | Power off and delete a VM vmdeploy deployed, or every VM of a batch | vSphere, after you confirm |
+| [`logs`](#vmdeploy-logs) | Show the log folder and recent batches and logs, or choose the folder | This computer only |
 | [`images list`, `pull`, `clear-cache`](#images) | Show local images and presets, download one in advance, empty the download cache | This computer only |
 | [`images prune`](#vmdeploy-images-prune) | Delete the ISO copies on datastores that no VM uses | vSphere: only the copies you choose |
 | [`trust list`, `add`, `remove`](#certificates) | Review, add or forget remembered certificates and vCenter root CAs | This computer only |
@@ -713,23 +724,98 @@ vmdeploy deploy -f examples/unattended.yaml --yes --json > result.json
 | `--replace` | Delete and re-create an existing VM with the same name. You are asked first; with `--yes` only VMs this tool created are replaced |
 | `--json` | Print a JSON summary when done (for scripts) |
 | `-p`, `--yes`, `--trust-fingerprint` | See [Options that work on most commands](#options-that-work-on-most-commands) |
+| `--batch` and the batch options | See [Deploying several VMs at once](#deploying-several-vms-at-once-batch) |
+
+#### Deploying several VMs at once (batch)
+
+A batch deploys one image, with the same VM settings, to many targets in one run: pick the hosts (or DRS
+clusters, or resource pools) and a datastore on each, review one plan for the whole batch, and the VMs are built
+in parallel. Each VM is built on its own, so a failure stays with that VM and the others carry on.
+
+```bash
+# Interactive: choose the hosts from a checklist, then the same questions as for one VM, asked once
+vmdeploy deploy --batch --preset ubuntu-lts
+
+# From a manifest with a `batch:` section (see examples/batch.yaml and docs/manifest.md)
+vmdeploy deploy -f examples/batch.yaml
+vmdeploy deploy -f examples/batch.yaml --yes --json > results.json
+
+# Deploy again only the VMs that failed, were skipped or were not started. The batch prints the path of its
+# results file (batch-<date>-<time>.json, in the log folder) at the end; `latest` is the newest one there.
+# Nothing else is needed: the manifest, image, profile, batch options and answers are that run's.
+vmdeploy deploy --retry-failed latest
+vmdeploy deploy --retry-failed batch-20260301-091500.json   # an older one, by name
+
+# Delete every VM the batch deployed (one sign-in, one confirmation)
+vmdeploy destroy --batch latest
+```
+
+What you choose:
+
+- **Targets**: hosts from a checklist (hosts that cannot take VMs are shown greyed out with the reason), every
+  host of a cluster, a DRS cluster that places the VMs itself, or in a manifest also a host folder, hosts whose
+  name matches a pattern (`esx-east-*`), or a resource pool (for hosted VMware clouds, where hosts are hidden).
+- **How many**: the same number on every target, or a number in total spread by free memory.
+- **Names** from a pattern: `web-{n:02}` gives web-01, web-02, ...; `app-{host}-{i}` numbers the VMs per host.
+  **VM names must be unique in their VM folder**, not just on their host, and every VM of a batch goes into the
+  same folder (with a restricted deploy account, the account's own folder), so two hosts cannot both have a
+  `web-01` there. To number the VMs on each host separately, put the host in the name: `web-{host}-{i:02}` gives
+  web-esx-a-01, web-esx-a-02, web-esx-b-01, ... (a host added to vCenter by its address becomes `192-0-2-11`). A
+  pattern that gives two VMs the same name is refused before the review. Plan any naming scheme the pattern
+  cannot express as a step after the deployment: you can rename the VMs in the vSphere Client later, and
+  `vmdeploy list` and `destroy` still recognise them (by a marker in the VM's Notes, not by name). Renaming
+  changes neither the guest's hostname, which cloud-init set at first boot, nor the names of the VM's files on
+  its datastore.
+- **Per-VM settings can be skipped.** Hostnames: the same as the VM name, a pattern, or left to the image.
+  Addresses: DHCP, or static from a range (a pool: addresses already in use are skipped) or a list (one per VM). Turn guest settings off to just create the VMs and set them
+  up yourself. OVF properties (appliance settings) can use `{name}`, `{address}` and the other placeholders.
+
+Before anything changes, every VM is checked: free space added up per datastore across the whole batch, the
+network on each host (and the same VLAN on each), a VM compatibility every host supports, names that already
+exist (with the folder and host where they are), static addresses already in use, and the account's privileges.
+The review lists every VM that fails a check and why; deploy the others, change your answers, or cancel. With
+`--yes` they are skipped (or, with `batch.on_check_failure: cancel`, nothing is deployed).
+
+While the batch runs, a table shows each VM's step and progress. A VM that fails half-way is deleted (keep it with
+`--keep-failed`); `--stop-on-failure` starts no new VMs after a failure. Ctrl+C stops starting new VMs and asks
+whether to let the running ones finish or to stop and clean them up. At the end, a summary per host and a list of
+every VM that did not deploy, with the step and the reason, and a results file for `--retry-failed`.
+
+| Option | Meaning |
+|---|---|
+| `--batch` | Deploy a batch (a manifest with `batch:` implies it) |
+| `--parallel N` | VMs built at the same time (default 4). A VM that is built and only waits for its guest's address does not count |
+| `--parallel-uploads N` | Uploads from this computer at the same time (default 2): OVA/OVF disks are uploaded once per VM |
+| `--per-host N` | VMs built on one host at the same time (default 2). vCenter runs at most 8 deployments per host at once and queues the rest, so more than 8 is refused |
+| `--stop-on-failure` | Start no new VMs after one fails (for troubleshooting) |
+| `--keep-failed` | Keep a VM that failed half-way instead of deleting it |
+| `--retry-failed FILE` | Deploy only the VMs that the results file lists as failed, skipped or not started, the way that run did: its manifest, image source, profile and batch options (`--batch` is implied; anything given again on the command line wins), and the same answers: each question is answered as before (shown with "as in the first run") while the answer still fits, so only the password is asked (and nothing with `--yes`); "Change my answers" at the review changes any. Licences and passwords are never reused, nor a URL holding a password or token (it is asked again; with `--yes`, give `--url`). If that run's manifest is gone, what it set is asked again (`--yes` stops). If the image is not the one that run deployed (e.g. a newer `ubuntu-lts` build), the review says so (`--yes` stops). `latest` is the newest results file in the [log folder](#vmdeploy-logs); a file name alone is looked up there too |
+| `--replace` | VM names that already exist: delete and re-create those VMs (only VMs this tool deployed) |
+
+An ISO is placed once and copied by vCenter to the other datastores that need it, so it leaves your computer at
+most once. An OVA/OVF is uploaded once per VM.
 
 ### Removing VMs
 
 #### `vmdeploy destroy`
 
-Powers off and permanently deletes a VM and its disks, after asking you to confirm.
+Powers off and permanently deletes a VM and its disks, after asking you to confirm. With `--batch`, every VM a
+batch deployed: one sign-in, one list, one confirmation.
 
 ```bash
 vmdeploy destroy ubuntu01
 vmdeploy destroy ubuntu01 --datacenter Lab     # when several datacenters have a VM with that name
 vmdeploy destroy old-vm --force                # also allow VMs this tool did not create
 vmdeploy destroy win01 --delete-iso            # also delete the ISO copy it used (if no other VM uses it)
+vmdeploy destroy --batch latest                # every VM the newest batch deployed (see below)
+vmdeploy destroy --batch RESULTS.json          # every VM a batch deployed, from its results file
+vmdeploy destroy --batch RESULTS.json --batch RETRY.json   # a batch and its --retry-failed run
 ```
 
 | Option | Meaning |
 |---|---|
 | `NAME` | The VM's name, as `vmdeploy list` shows it |
+| `--batch RESULTS.json` | The VMs a batch deployed (and a VM that failed half-way and could not be deleted then), from the results file it printed at the end (repeat for its retries). `latest` is the newest results file in the [log folder](#vmdeploy-logs) (the command says which file it took, and the list is shown before anything is deleted); a file name alone is looked up there too. A retry's file includes the run it retried, so one command deletes both. VMs renamed since are still found when the file is from the same vCenter; VMs already deleted are skipped; only VMs vmdeploy deployed are deleted (`--force` and `--datacenter` do not apply). One VM's failure does not stop the others; exit code 4 when some were not deleted |
 | `--datacenter NAME` | Which datacenter, when several have a VM with that name |
 | `--force` | Also allow deleting a VM that vmdeploy did not deploy |
 | `--delete-iso` / `--keep-iso` | Delete or keep the VM's `vmdeploy-iso/` copy without being asked (default: ask; kept with `--yes`) |
@@ -739,6 +825,43 @@ If the VM was installed from an ISO that vmdeploy put in a `vmdeploy-iso/` folde
 or copied from another host), `destroy` then asks **separately** whether to delete that copy too, but only if no
 other VM uses it. The default is to keep it: the next deployment to that datastore reuses it (after checking
 it) instead of uploading or copying again. `--delete-iso` / `--keep-iso` answer the question in scripts.
+
+### Logs and results files
+
+#### `vmdeploy logs`
+
+Every run writes a log file (secrets removed), and every batch writes a results file
+(`batch-<date>-<time>.json`) that `destroy --batch` and `--retry-failed` read. `vmdeploy logs` shows the
+folder they are in and lists the recent ones, newest first: for each batch, when it started, the datacenter,
+the image and how many VMs deployed.
+
+```bash
+vmdeploy logs                                  # the folder, recent batches and log files
+vmdeploy logs -n 30                            # more of each
+vmdeploy logs --folder "D:\Ops\vmdeploy-logs"   # keep them here from now on
+vmdeploy logs --folder default                 # back to the standard folder
+```
+
+By default they are kept in your user profile ([Where things are stored](#where-things-are-stored)), which
+every user can write to without administrator rights. Choose another folder when they should outlast a
+logoff or be reachable from other computers:
+
+- **Several computers:** a synced folder (OneDrive, SharePoint) or a network share. A results file works from
+  any computer: `destroy --batch` connects to the vCenter and finds the VMs by their ID (renamed ones too).
+- **Non-persistent virtual desktops** (VMware Horizon instant clones, Citrix): the user profile may be emptied
+  at logoff, so use a home drive or synced folder. If the whole profile is reset, this setting goes with it:
+  set `VMDEPLOY_LOG_DIR` in a logon script instead (and `VMDEPLOY_CONFIG_DIR` to keep profiles and
+  certificates).
+- **Not inside a Git repository or a public share.** Logs and results files name your vCenter, hosts, VMs
+  and addresses (never passwords). vmdeploy warns when the folder is inside a Git repository.
+- **Only you can write to it**, not a folder shared with a team: a results file in it decides what
+  `deploy --retry-failed` deploys (image, manifest, answers) and which VMs `destroy --batch` deletes, and
+  `latest` takes whichever file there has the newest name.
+
+The setting is kept per user on each computer, so set it once on each computer. `VMDEPLOY_LOG_DIR`, when set,
+comes first. If the chosen folder cannot be reached (a disconnected share or drive), vmdeploy says so and uses
+the standard folder for that run; it never creates the missing share or drive's folders on this computer.
+Files already in the old folder stay there.
 
 ### Images
 
@@ -932,7 +1055,7 @@ vmdeploy access setup -p esxi01 --yes --user vmdeploy --no-remember     # standa
 |---|---|
 | `--user` | vCenter: existing user (`user@domain`). ESXi: name of the local user to create (default `vmdeploy`) |
 | `--new-folder NAME` | vCenter: create a folder just for this account (recommended), at the top (`vmdeploy-ops`) or inside an existing folder (`Lab/vmdeploy-ops`); `access remove` deletes it when empty |
-| `--datacenter`, `--folder`, `--compute` | vCenter: where VMs may be created. `--folder` picks an existing folder (`/` is the datacenter's top VM folder); `--compute` is a cluster or host name |
+| `--datacenter`, `--folder`, `--compute` | vCenter: where VMs may be created. `--folder` picks an existing folder (`/` is the datacenter's top VM folder); `--compute` is a cluster or host name (repeat it for several, e.g. for batches) |
 | `--datastore`, `--network` | vCenter: which datastores and networks may be used (repeat the option for more than one) |
 | `--image-datastore` | vCenter: where the account may find images. `all` (default): see every datastore, copy rights where images are; `none`; or datastore names (repeatable) for copy rights only there |
 | `--new-profile NAME` | Name of the profile to create for the account |
@@ -1125,7 +1248,8 @@ Manifest paths may use `/` on every OS, including Windows.
 - Untrusted certificates are refused in `--yes` mode. Trust them once interactively (`vmdeploy trust add`),
   or pass `--trust-fingerprint <SHA-256>` after verifying the fingerprint out-of-band.
 - Exit codes: `0` success, `1` error, `2` configuration / missing input, `3` licence restriction,
-  `130` cancelled or declined.
+  `4` a batch deployed some VMs but not all, `130` cancelled or declined. A batch where no VM deployed exits
+  with `1`.
 
 ## Troubleshooting
 
@@ -1145,18 +1269,21 @@ Manifest paths may use `/` on every OS, including Windows.
 | Windows 11 stops: the host is not in a cluster, or there is no vCenter | See [Virtual TPM: where it works](#virtual-tpm-where-it-works). |
 | `already has rights across this vCenter` in `access setup` | Use a dedicated account that is in no group (see [Step 4](#step-4-use-a-restricted-account-for-deployments-optional-recommended)). |
 | No IP address reported for an appliance | Many appliances (routers, firewalls) do not report their address to vCenter; check in the VM console. |
+| `The session is not authenticated` | vCenter and ESXi end sessions that are idle for a while (30 minutes by default). When a review was left open that long, vmdeploy asks for the password again before changing anything (`--yes` runs sign in again by themselves); with a federated (SSO) sign-in, run the command again. |
 | Anything else | Run the command again with `-v` (`vmdeploy -v deploy …`) and look at the log file printed at the end. |
 
 ## Where things are stored
 
 Everything is kept in your own user profile, in the standard place for your operating system. Nothing is
-written to the install folder, and no administrator / root rights are needed.
+written to the install folder, and no administrator / root rights are needed. Logs and batch results files can
+be kept in another folder instead, e.g. one that outlasts a logoff or is shared between your computers: see
+[`vmdeploy logs`](#vmdeploy-logs).
 
 | What | Windows | macOS | Linux | Override |
 |---|---|---|---|---|
-| Profiles, trusted certificates, accounts used with `access setup` | `%LOCALAPPDATA%\vsphere-vm-deployment` | `~/Library/Application Support/vsphere-vm-deployment` | `~/.config/vsphere-vm-deployment` | `VMDEPLOY_CONFIG_DIR` |
+| Profiles, trusted certificates, accounts used with `access setup`, settings (`settings.json`) | `%LOCALAPPDATA%\vsphere-vm-deployment` | `~/Library/Application Support/vsphere-vm-deployment` | `~/.config/vsphere-vm-deployment` | `VMDEPLOY_CONFIG_DIR` |
 | Downloaded images | `%LOCALAPPDATA%\vsphere-vm-deployment\Cache\images` | `~/Library/Caches/vsphere-vm-deployment/images` | `~/.cache/vsphere-vm-deployment/images` | `VMDEPLOY_CACHE_DIR` |
-| Logs (secrets removed), and long licence texts (`licences/`) | `%LOCALAPPDATA%\vsphere-vm-deployment\Logs` | `~/Library/Logs/vsphere-vm-deployment` | `~/.local/state/vsphere-vm-deployment/log` | `VMDEPLOY_LOG_DIR` |
+| Logs (secrets removed), batch results files, and long licence texts (`licences/`) | `%LOCALAPPDATA%\vsphere-vm-deployment\Logs` | `~/Library/Logs/vsphere-vm-deployment` | `~/.local/state/vsphere-vm-deployment/log` | [`vmdeploy logs --folder`](#vmdeploy-logs), or `VMDEPLOY_LOG_DIR` |
 | Local images for `--local` | `.\images` in the current folder | `./images` in the current folder | `./images` in the current folder | `VMDEPLOY_IMAGES_DIR` |
 | Passwords / client secrets | Credential Manager | Keychain | Secret Service (GNOME Keyring, KWallet) | Only stored if you enable it for the profile |
 
@@ -1196,6 +1323,10 @@ To remove everything after uninstalling, also delete the folders listed in the t
 - **Windows** is installed from its ISO in the VM console (with the right virtual hardware set up for you);
   an unattended install with an answer file is planned. See [docs/windows.md](docs/windows.md).
 - **Multi-VM OVF packages** (vApps / VirtualSystemCollection) are not supported.
+- **Batches** use one connection: one vCenter (any of its hosts) or one ESXi host. Several vCenters or standalone
+  hosts in one batch is planned. Each VM of an OVA/OVF batch is uploaded from your computer; deploying once and
+  cloning the rest (and templates, Content Library, choosing targets by vSphere tag) is to be explored.
+  Datastore clusters (Storage DRS) cannot be chosen as a target; choose their datastores.
 - **First-boot network settings** (`guest.network`) configure the first network adapter only; configure any
   others inside the guest.
 - **OVAs/OVFs always pass through your computer**, even when already on a datastore (vSphere's import works

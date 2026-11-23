@@ -387,14 +387,19 @@ def vm_properties(conn: Connection, paths: list[str], root=None) -> list[tuple[o
     """These properties of every VM under `root` (default: the whole inventory), in one bulk read (paged for large
     inventories). Reading `vm.name` or `vm.config` VM by VM sends a request each time (pyVmomi caches nothing), and
     `vm.config` downloads the whole configuration. A property the server leaves out (e.g. an unset configuration)
-    is missing from the dict. A failed read raises: callers decide what to show or delete."""
+    is missing from the dict. A failed read raises: callers decide what to show or delete. `name` is given as typed
+    in vCenter (the API escapes '/' as %2f), so it can be shown and compared with names the user typed."""
     from .errors import DeploymentError
     from .tasks import fault_message
 
     try:
-        return collect(conn, vim.VirtualMachine, paths, root=root, strict=True)
+        rows = collect(conn, vim.VirtualMachine, paths, root=root, strict=True)
     except Exception as e:  # noqa: BLE001
         raise DeploymentError(f"Could not read the VMs: {fault_message(e)}") from e
+    for _vm, props in rows:
+        if props.get("name"):
+            props["name"] = display(props["name"])
+    return rows
 
 
 def vm_properties_of(conn: Connection, vm, paths: list[str]) -> dict:

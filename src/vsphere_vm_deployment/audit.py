@@ -144,7 +144,8 @@ def run(conn: Connection) -> list[Section]:
                 cs = str(props.get("runtime.connectionState") or "connected")
                 if cs != "connected":  # e.g. deleted on the host directly: vCenter keeps an orphaned entry
                     state, stale = f"{state}, {cs}", True
-                s.rows.append((props.get("name", "?"), "deployed by vmdeploy" if marked else "name only", state))
+                s.rows.append((inventory.display(props.get("name", "?")), "deployed by vmdeploy" if marked else "name only",
+                               state))
         s.advice = "Delete with `vmdeploy destroy <name>` (or `vmdeploy access remove` for the account's folder)."
         if stale:
             s.advice += (" Orphaned or inaccessible: vCenter lists a VM its host no longer has (for example one "

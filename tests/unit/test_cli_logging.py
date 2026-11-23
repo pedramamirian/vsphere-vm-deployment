@@ -20,3 +20,10 @@ def test_error_is_written_to_the_log_file(isolated_dirs):
 def test_error_is_not_shown_twice_with_verbose(isolated_dirs):
     r = CliRunner().invoke(app, ["-v", "doctor", "--yes", "-p", "no-such-profile"])
     assert r.output.count("No profile named") == 1
+
+
+def test_the_profile_option_works_before_the_command_too(isolated_dirs):
+    """Found in real testing: `vmdeploy -p NAME doctor` failed with "No such option: -p" while -v must go there."""
+    for args in (["-p", "no-such-profile", "doctor", "--yes"], ["doctor", "--yes", "-p", "no-such-profile"]):
+        r = CliRunner().invoke(app, args)
+        assert "No such option" not in r.output and "No profile named 'no-such-profile'" in r.output

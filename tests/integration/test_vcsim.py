@@ -14,6 +14,7 @@ Run with:  VCSIM_BIN=/path/to/vcsim pytest -m vcsim
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import os
 import shutil
@@ -24,6 +25,7 @@ from pathlib import Path
 
 import pytest
 import vcsim_compat
+import yaml
 from ovabuilder import build_ova
 from pyVim.connect import Disconnect, SmartConnect
 from pyVmomi import vim
@@ -33,6 +35,7 @@ from vsphere_vm_deployment import ANNOTATION_MARKER
 from vsphere_vm_deployment.access import inherited_rights as _REAL_INHERITED_RIGHTS
 from vsphere_vm_deployment.access import rights_at_top as _REAL_RIGHTS_AT_TOP
 from vsphere_vm_deployment.cli import app
+from vsphere_vm_deployment.tasks import wait_task
 from vsphere_vm_deployment.trust import CertInfo, fetch_peer_cert
 
 pytestmark = pytest.mark.vcsim
@@ -362,6 +365,30 @@ def test_standalone_esxi_ova_and_iso(esxsim, isolated_dirs, monkeypatch):
     r = run("deploy", "-f", m2, "--local", "installer.iso", "--yes", "--trust-fingerprint", esxsim["fp"])
     assert "installer is waiting" in r.output
 
+    # A batch on a host reached directly (no vCenter): several VMs on it, each over its own cloned session, with
+    # cloud-init through guestinfo and hostnames left to the image.
+    mb = manifest(isolated_dirs, f"""
+guest: {{username: alex, ssh_authorized_keys: ['{key}']}}
+post_deploy: {{power_on: false, wait_for_ip: false}}
+batch:
+  name: "esx-bt-{{n}}"
+  hostname: skip
+  targets: [{{hosts_matching: "*", datastore: auto, count: 3}}]
+  parallel: {{vms: 3, per_host: 3}}
+""")
+    r = run("deploy", "-f", mb, "--local", "ubuntu-test.ova", "--yes", "--trust-fingerprint", esxsim["fp"], "--json")
+    doc = json.loads(r.stdout[r.stdout.index("{"):])
+    assert doc["exit_code"] == 0 and [v["name"] for v in doc["vms"]] == ["esx-bt-1", "esx-bt-2", "esx-bt-3"]
+    assert all(v["hostname"] is None for v in doc["vms"])
+    s = SmartConnect(host="127.0.0.1", port=esxsim["port"], user="root", pwd=PASSWORD, disableSslCertValidation=True)
+    try:
+        vm = find_vm(s, "esx-bt-2")
+        extra = {o.key: o.value for o in vm.config.extraConfig}
+        user_data = gzip.decompress(base64.b64decode(extra["guestinfo.userdata"])).decode()
+        assert "alex" in user_data and "hostname" not in user_data
+    finally:
+        Disconnect(s)
+
 
 # ------------------------------------------------------------------------------------------------- access setup
 @pytest.fixture(autouse=True)
@@ -427,18 +454,19 @@ def _roles(si) -> dict[str, int]:
 
 def test_access_setup_and_remove_on_vcenter(cli, si):
     r = cli("access", "setup", "--yes", "--trust-fingerprint", cli.fp, "--user", "svc-deploy@vsphere.local",
-            "--folder", "/", "--compute", "DC0_C0", "--datastore", "LocalDS_0", "--network", "VM Network",
-            "--network", "DC0_DVPG0", "--new-profile", "sim-deployer")
+            "--folder", "/", "--compute", "DC0_C0", "--compute", "DC0_H0", "--datastore", "LocalDS_0",
+            "--network", "VM Network", "--network", "DC0_DVPG0", "--new-profile", "sim-deployer")
     assert "Access created for" in r.output and r"VSPHERE.LOCAL\svc-deploy" in r.output
     roles = _roles(si)
     assert {"vmdeploy-deployer", "vmdeploy-deployer-read"} <= set(roles)
     am = si.RetrieveContent().authorizationManager
-    # folder, cluster, datastore, standard + distributed portgroup; plus the read role at the top
+    # folder, the cluster and a standalone host (several, for batches: found in real testing, setup allowed one),
+    # datastore, standard + distributed portgroup; plus the read role at the top
     deploy_perms = am.RetrieveRolePermissions(roleId=roles["vmdeploy-deployer"])
-    assert len(deploy_perms) == 5
+    assert len(deploy_perms) == 6
     # Only the folder grant applies to objects inside it: VMs also inherit from their resource pool, so the
     # cluster's pool is granted for placement only and existing VMs there stay out of reach
-    assert sorted(p.propagate for p in deploy_perms) == [False, False, False, False, True]
+    assert sorted(p.propagate for p in deploy_perms) == [False, False, False, False, False, True]
     assert len(am.RetrieveRolePermissions(roleId=roles["vmdeploy-deployer-read"])) == 1
     assert "sim-deployer" in cli("profile", "list").output
     assert "vmdeploy-deployer" in cli("doctor", "--yes", "--trust-fingerprint", cli.fp).output
@@ -1451,3 +1479,410 @@ def test_keyprovider_backup_reports_a_vcenter_without_one(cli):
     out = " ".join(r.output.split())
     assert r.exit_code != 0 and "Unexpected error" not in out
     assert "no Native Key Provider" in out or "Could not list the key providers" in out
+
+
+# ------------------------------------------------------------------------------------------------- batch
+def _batch_doc(r) -> dict:
+    return json.loads(r.stdout[r.stdout.index("{"):])
+
+
+def test_batch_ova_to_several_hosts_with_patterns_and_addresses(cli, si):
+    """One OVA to three hosts (one of them twice), names and hostnames from patterns, static addresses from a
+    range, built in parallel over cloned sessions; the results file and the summary list every VM."""
+    build_ova(cli.images / "ubuntu-test.ova")
+    m = manifest(cli.tmp, """
+resources: {cpu: 1, memory_gb: 1}
+networks: [{portgroup: VM Network}]
+guest:
+  username: tester
+  ssh_authorized_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey tester@ci"]
+post_deploy: {power_on: true, wait_for_ip: false, snapshot: false}
+batch:
+  name: "bt-web-{n:02}"
+  hostname: "web{n}-{host}"
+  targets:
+    - {host: DC0_C0_H0, datastore: LocalDS_0}
+    - {host: DC0_C0_H1, datastore: auto, count: 2}
+    - {host: DC0_H0, datastore: LocalDS_0}
+  addresses: {mode: static, range: 203.0.113.60-70, prefix: 24, gateway: 203.0.113.1, dns: [203.0.113.1]}
+  parallel: {vms: 3, uploads: 2, per_host: 1}
+""")
+    r = cli("deploy", "-f", m, "--local", "ubuntu-test.ova", "--yes", "--trust-fingerprint", cli.fp, "--json")
+    doc = _batch_doc(r)
+    assert doc["exit_code"] == 0 and doc["totals"]["deployed"] == 4, r.output
+    names = [v["name"] for v in doc["vms"]]
+    assert names == ["bt-web-01", "bt-web-02", "bt-web-03", "bt-web-04"]
+    assert [v["host"] for v in doc["vms"]] == ["DC0_C0_H0", "DC0_C0_H1", "DC0_C0_H1", "DC0_H0"]
+    assert [v["address"] for v in doc["vms"]] == [f"203.0.113.{x}/24" for x in (60, 61, 62, 63)]
+    assert Path(doc["results_file"]).is_file() and "Batch finished" in r.stderr
+    for v in doc["vms"]:
+        vm = find_vm(si, v["name"])
+        assert vm is not None and vm.runtime.host.name == v["host"]
+        props = {p.id: p.value for p in vm.config.vAppConfig.property}
+        user_data = base64.b64decode(props["user-data"]).decode()
+        assert v["address"] in user_data and props["hostname"] == v["hostname"]
+    assert doc["vms"][1]["hostname"] == "web2-DC0-C0-H1"  # a DNS label: "_" becomes "-"
+
+
+def _fail_upload_for(monkeypatch, name: str) -> None:
+    """The disk upload of VM `name` fails (connection reset); every other VM uploads normally."""
+    from vsphere_vm_deployment import deploy as deploy_mod
+    from vsphere_vm_deployment.logsetup import _context
+
+    real = deploy_mod.upload_stream
+
+    def upload(*a, **k):
+        if getattr(_context, "label", None) == name:
+            raise ConnectionResetError("connection reset by the host (test)")
+        return real(*a, **k)
+
+    monkeypatch.setattr(deploy_mod, "upload_stream", upload)
+    monkeypatch.setattr(deploy_mod.Deployment, "IMPORT_ABORT_WAIT_S", 2)  # vcsim never removes it: vmdeploy does
+
+
+BATCH_THREE = """
+networks: [{portgroup: VM Network}]
+guest: {enabled: false}
+post_deploy: {power_on: false}
+batch:
+  name: "NAME-{n}"
+  targets:
+    - {host: DC0_C0_H0, datastore: LocalDS_0}
+    - {host: DC0_C0_H1, datastore: LocalDS_0}
+    - {host: DC0_C0_H2, datastore: LocalDS_0}
+  parallel: {vms: VMS}
+"""
+
+
+def _three(name: str, vms: int = 3) -> str:
+    return BATCH_THREE.replace("NAME", name).replace("VMS", str(vms))
+
+
+def test_batch_failure_is_isolated_listed_and_retried(cli, si, monkeypatch):
+    """One VM's upload fails: only it fails (its partial VM is removed), the others deploy, the exit code is 4, the
+    summary names the host, step and reason, and --retry-failed deploys only that VM."""
+    build_ova(cli.images / "ubuntu-test.ova")
+    m = manifest(cli.tmp, _three("bt-fail"))
+    args = ["deploy", "-f", m, "--local", "ubuntu-test.ova", "--yes", "--trust-fingerprint", cli.fp]
+    # Only the failure is undone afterwards: monkeypatch.undo() would also undo the isolated config folders, and the
+    # CLI would then use the real profile of whoever runs the tests.
+    with monkeypatch.context() as failing:
+        _fail_upload_for(failing, "bt-fail-2")
+        r = cli(*args, "--json", ok=False)
+    doc = _batch_doc(r)
+    assert r.exit_code == 4 and doc["exit_code"] == 4
+    by = {v["name"]: v for v in doc["vms"]}
+    assert by["bt-fail-1"]["status"] == by["bt-fail-3"]["status"] == "deployed"
+    assert by["bt-fail-2"]["status"] == "failed" and by["bt-fail-2"]["host"] == "DC0_C0_H1"
+    assert by["bt-fail-2"]["step"] == "Upload disks" and "connection reset" in by["bt-fail-2"]["error"]
+    assert find_vm(si, "bt-fail-2") is None and find_vm(si, "bt-fail-1") is not None
+    out = " ".join(r.stderr.split())
+    assert "Not deployed" in out and "--retry-failed" in out and "Upload disks" in out
+    assert "partial" in out and doc["vms"][1]["kept"] is False
+
+    r = cli(*args, "--retry-failed", doc["results_file"], "--json")
+    again = _batch_doc(r)
+    assert again["exit_code"] == 0 and [v["name"] for v in again["vms"]] == ["bt-fail-2"]
+    assert find_vm(si, "bt-fail-2").runtime.host.name == "DC0_C0_H1"
+
+    # destroy --batch with the batch's results file and its retry's: one confirmation for every VM they deployed.
+    # A VM renamed since is still found (by its id, the file being from this vCenter); one whose Notes lost the
+    # vmdeploy marker is refused and listed, so the exit code is 4.
+    wait_task(find_vm(si, "bt-fail-1").Rename_Task(newName="bt-fail-1-renamed"))
+    wait_task(find_vm(si, "bt-fail-3").ReconfigVM_Task(spec=vim.vm.ConfigSpec(annotation="someone else's VM")))
+    r = cli("destroy", "--batch", doc["results_file"], "--batch", again["results_file"], "--yes",
+            "--trust-fingerprint", cli.fp, ok=False)
+    out = " ".join(r.output.split())
+    assert r.exit_code == 4, out
+    assert find_vm(si, "bt-fail-1-renamed") is None and find_vm(si, "bt-fail-2") is None
+    assert find_vm(si, "bt-fail-3") is not None and "not deployed by vmdeploy" in out
+    assert "bt-fail-1-renamed (was" in out and "Deleted 2 of 2" in out, out  # the cell may wrap
+    wait_task(find_vm(si, "bt-fail-3").Destroy_Task())
+
+    # Nothing left: the same files now only list VMs that are gone. `latest` is the newest file (the retry's).
+    r = cli("destroy", "--batch", doc["results_file"], "--yes", "--trust-fingerprint", cli.fp)
+    assert "Nothing to delete" in " ".join(r.output.split())
+    r = cli("destroy", "--batch", "latest", "--yes", "--trust-fingerprint", cli.fp)
+    out = " ".join(r.output.split())
+    assert "Newest results file" in out and "Nothing to delete" in out
+    r = cli("destroy", "bt-fail-1", "--batch", doc["results_file"], "--yes", "--trust-fingerprint", cli.fp, ok=False)
+    assert r.exit_code == 2 and "leave out the VM name" in " ".join(r.output.split())
+
+
+def test_dhcp_identifier_is_set_before_the_first_boot(cli, si):
+    """DHCP: the guest identifies itself by NIC 1's MAC address, through a `network-config` OVF property that
+    cloud-init reads before the network starts (the image does not declare it: it is added to the VM). With
+    `dhcp_identifier: image` nothing is added."""
+    build_ova(cli.images / "ubuntu-test.ova")
+    guest = """
+networks: [{portgroup: VM Network}]
+guest:
+  username: tester
+  ssh_authorized_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey tester@ci"]
+  DHCPID
+post_deploy: {power_on: false}
+batch:
+  name: "NAME-{n}"
+  targets: [{host: DC0_C0_H0, datastore: LocalDS_0, count: 2}]
+"""
+    for name, setting in (("bt-dhcp-mac", ""), ("bt-dhcp-image", "dhcp_identifier: image")):
+        m = manifest(cli.tmp, guest.replace("NAME", name).replace("DHCPID", setting))
+        r = cli("deploy", "-f", m, "--local", "ubuntu-test.ova", "--yes", "--trust-fingerprint", cli.fp, "--json")
+        assert _batch_doc(r)["exit_code"] == 0, r.output
+    for k in (1, 2):
+        vm = find_vm(si, f"bt-dhcp-mac-{k}")
+        props = {p.id: p.value for p in vm.config.vAppConfig.property}
+        net = yaml.safe_load(base64.b64decode(props["network-config"]))["network"]
+        eth = net["ethernets"]["primary"]
+        mac = next(d.macAddress for d in vm.config.hardware.device if isinstance(d, vim.vm.device.VirtualEthernetCard))
+        assert eth["dhcp4"] is True and eth["dhcp-identifier"] == "mac" and eth["match"]["macaddress"] == mac.lower()
+        assert "network-config" not in {p.id for p in find_vm(si, f"bt-dhcp-image-{k}").config.vAppConfig.property}
+
+
+def test_batch_stop_on_failure_and_keep_failed(cli, si, monkeypatch):
+    """--stop-on-failure: after the first failure no new VM starts (listed as not started). --keep-failed: a VM
+    that failed after it was created is kept, and the summary says so."""
+    from vsphere_vm_deployment import deploy as deploy_mod
+    from vsphere_vm_deployment.errors import DeploymentError
+    from vsphere_vm_deployment.logsetup import _context
+
+    build_ova(cli.images / "ubuntu-test.ova")
+    real = deploy_mod.reconfigure_spec
+
+    def reconfigure(vm, **k):
+        if getattr(_context, "label", None) == "bt-stop-1":
+            raise DeploymentError("Reconfigure VM failed: test")
+        return real(vm, **k)
+
+    monkeypatch.setattr(deploy_mod, "reconfigure_spec", reconfigure)
+    m = manifest(cli.tmp, _three("bt-stop", 1))
+    r = cli("deploy", "-f", m, "--local", "ubuntu-test.ova", "--yes", "--trust-fingerprint", cli.fp, "--json",
+            "--stop-on-failure", "--keep-failed", ok=False)
+    doc = _batch_doc(r)
+    assert [v["status"] for v in doc["vms"]] == ["failed", "not-started", "not-started"] and r.exit_code == 1
+    assert doc["vms"][0]["kept"] is True and find_vm(si, "bt-stop-1") is not None
+    assert "kept" in " ".join(r.stderr.split())  # "failed (VM kept)", possibly wrapped in the narrow test terminal
+    assert find_vm(si, "bt-stop-2") is None
+
+
+def test_batch_name_clash_is_listed_with_where_the_vm_is(cli, si):
+    """An existing name: the review says where that VM is (folder, host); --yes skips that VM and deploys the rest;
+    `on_check_failure: cancel` changes nothing (exit code 2)."""
+    build_ova(cli.images / "ubuntu-test.ova")
+    cli("deploy", "-f", manifest(cli.tmp, """
+vm: {name: bt-clash-2}
+placement: {cluster: DC0_C0, host: DC0_C0_H2, datastore: LocalDS_0}
+networks: [{portgroup: VM Network}]
+guest: {enabled: false}
+post_deploy: {power_on: false}
+"""), "--local", "ubuntu-test.ova", "--yes", "--trust-fingerprint", cli.fp)
+    cancel = manifest(cli.tmp, _three("bt-clash", 2) + "  on_check_failure: cancel\n")
+    r = cli("deploy", "-f", cancel, "--local", "ubuntu-test.ova", "--yes", "--trust-fingerprint", cli.fp, ok=False)
+    out = " ".join(r.output.split())
+    assert r.exit_code == 2 and "already exists (folder /, host DC0_C0_H2)" in out
+    assert find_vm(si, "bt-clash-1") is None
+    r = cli("deploy", "-f", manifest(cli.tmp, _three("bt-clash", 2)), "--local", "ubuntu-test.ova", "--yes",
+            "--trust-fingerprint", cli.fp, "--json", ok=False)
+    doc = _batch_doc(r)
+    assert r.exit_code == 4 and [v["status"] for v in doc["vms"]] == ["deployed", "skipped", "deployed"]
+    assert "already exists (folder /, host DC0_C0_H2)" in doc["vms"][1]["error"]
+
+
+def test_batch_iso_is_uploaded_once_and_drs_places_the_vms(cli, si):
+    """An ISO batch: uploaded once, then used by every VM; a DRS cluster target places its VMs itself."""
+    (cli.images / "batch.iso").write_bytes(os.urandom(1024 * 1024))
+    _set_drs(si, "DC0_C0", True)
+    try:
+        m = manifest(cli.tmp, """
+resources: {cpu: 1, memory_gb: 1, disk_gb: 8}
+hardware: {guest_os: ubuntu64Guest, firmware: efi, secure_boot: false}
+networks: [{portgroup: VM Network}]
+post_deploy: {power_on: false}
+batch:
+  name: "bt-drs-{n}"
+  targets:
+    - {cluster: DC0_C0, drs: true, count: 2, datastore: LocalDS_0}
+    - {host: DC0_H0, datastore: LocalDS_0}
+""")
+        r = cli("deploy", "-f", m, "--local", "batch.iso", "--yes", "--trust-fingerprint", cli.fp, "--json")
+    finally:
+        _set_drs(si, "DC0_C0", False)
+    doc = _batch_doc(r)
+    assert doc["exit_code"] == 0 and [v["host"] for v in doc["vms"]] == ["DC0_C0 (DRS)"] * 2 + ["DC0_H0"]
+    for v in doc["vms"]:
+        vm = find_vm(si, v["name"])
+        cd = next(d for d in vm.config.hardware.device if isinstance(d, vim.vm.device.VirtualCdrom))
+        assert cd.backing.fileName == "[LocalDS_0] vmdeploy-iso/batch.iso"
+    assert r.stderr.count("Uploading batch.iso") <= 1
+
+
+def test_batch_limits_and_impossible_batches_change_nothing(cli, si):
+    build_ova(cli.images / "ubuntu-test.ova")
+    base = ["--local", "ubuntu-test.ova", "--yes", "--trust-fingerprint", cli.fp]
+    r = cli("deploy", "-f", manifest(cli.tmp, _three("bt-limit", 2)), *base, "--per-host", "9", ok=False)
+    assert r.exit_code == 2 and "at most 8" in " ".join(r.output.split())
+    big = manifest(cli.tmp, "resources: {disk_gb: 900000, disk_provisioning: thick}\n" + _three("bt-big", 2))
+    r = cli("deploy", "-f", big, *base, ok=False)
+    assert r.exit_code == 2 and "None of the batch's VMs can be deployed" in " ".join(r.output.split())
+    assert find_vm(si, "bt-big-1") is None
+    r = cli("deploy", "--batch", *base, ok=False)
+    assert r.exit_code == 2 and "batch.targets" in r.output
+    r = cli("deploy", "--parallel", "3", *base, ok=False)
+    assert r.exit_code == 2 and "only work(s) for a batch" in r.output
+
+
+def _scripted_prompter(monkeypatch, answers: dict[str, object]) -> list[str]:
+    """Answer the interactive questions without a terminal: the first `answers` key found in a question gives its
+    answer; any other question takes its default (or its first choice). Returns the questions asked."""
+    from vsphere_vm_deployment import ui
+
+    asked: list[str] = []
+    real_init = ui.Prompter.__init__
+
+    def init(self, interactive, view=None):
+        real_init(self, interactive, view)
+        self.interactive = interactive  # as if stdin were a terminal
+
+    def pick(question, default, fallback):
+        asked.append(question)
+        for key, value in answers.items():
+            if key in question:
+                return value
+        return default if default is not None else fallback
+
+    def kept(self, k, value):  # remembered like a real answer (results files save them for --retry-failed)
+        return self._keep(k.get("answer_key") or k.get("field_name", ""), value)
+
+    monkeypatch.setattr(ui.Prompter, "__init__", init)
+    monkeypatch.setattr(ui.Prompter, "select", lambda self, q, choices, default=None, **k:
+                        kept(self, k, pick(q, default, choices[0][1])))
+    monkeypatch.setattr(ui.Prompter, "checkbox", lambda self, q, choices, **k:
+                        kept(self, k, pick(q, None, [choices[0][1]])))
+    monkeypatch.setattr(ui.Prompter, "text", lambda self, q, default=None, **k: kept(self, k, pick(q, default, "")))
+    monkeypatch.setattr(ui.Prompter, "integer", lambda self, q, default=None, **k: kept(self, k, pick(q, default, 1)))
+    monkeypatch.setattr(ui.Prompter, "confirm", lambda self, q, default=False, **k:
+                        kept(self, k, pick(q, default, default)))
+    return asked
+
+
+def test_batch_interactive_questions(cli, si, monkeypatch):
+    """The interactive batch: hosts from a checklist (an unusable host greyed out), the number of VMs, a name
+    pattern, one datastore choice for all hosts, hostnames, static addresses, the review, then the build."""
+    build_ova(cli.images / "ubuntu-test.ova")
+    m = manifest(cli.tmp, """
+resources: {cpu: 1, memory_gb: 1}
+networks: [{portgroup: VM Network}]
+guest: {username: tester, ssh_authorized_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey tester@ci"]}
+post_deploy: {power_on: false, snapshot: false}
+""")
+    asked = _scripted_prompter(monkeypatch, {
+        "Deploy to": [("host", "DC0_C0_H1"), ("host", "DC0_H0")],
+        "How many VMs?": "per_host", "VMs on each": 2,
+        "VM name pattern": "bt-int-{host}-{i}",
+        "Datastores:": "auto",
+        "Hostnames:": "{name}",
+        "Guest IP addresses": "static",
+        "Addresses: a range": "198.51.100.20-198.51.100.40", "Prefix length": 24,
+        "Default gateway": "198.51.100.1", "DNS servers": "198.51.100.1",
+        "What next?": "deploy",
+    })
+    r = cli("deploy", "--batch", "-f", m, "--local", "ubuntu-test.ova", "--trust-fingerprint", cli.fp, "--json")
+    doc = _batch_doc(r)
+    assert doc["exit_code"] == 0, r.output
+    assert [v["name"] for v in doc["vms"]] == ["bt-int-DC0_C0_H1-1", "bt-int-DC0_C0_H1-2", "bt-int-DC0_H0-1",
+                                               "bt-int-DC0_H0-2"]
+    assert [v["address"] for v in doc["vms"]] == [f"198.51.100.{x}/24" for x in (20, 21, 22, 23)]
+    assert doc["vms"][0]["hostname"] == "bt-int-DC0-C0-H1-1"
+    assert any("Deploy to" in q for q in asked) and any("What next?" in q for q in asked)
+    assert not any("Datastore on" in q for q in asked)  # one choice ("the most free space") for every host
+
+
+def test_a_session_that_expired_during_the_review_is_renewed(cli, si, monkeypatch):
+    """Found in real testing: with the review left open past vCenter's idle timeout, every VM failed with
+    NotAuthenticated (shown as pyVmomi's dump of the fault). The session is now checked after the review and
+    renewed over the same connection, so the objects read before it keep working; a single VM and a batch."""
+    from vsphere_vm_deployment import batch as batch_mod
+    from vsphere_vm_deployment import deploy as deploy_mod
+
+    def expire_after(cls):
+        real = cls._plan_and_review
+
+        def review_then_expire(self, inv):
+            real(self, inv)
+            self.conn.content.sessionManager.Logout()  # as vCenter does after 30 idle minutes
+        monkeypatch.setattr(cls, "_plan_and_review", review_then_expire)
+
+    build_ova(cli.images / "ubuntu-test.ova")
+    expire_after(deploy_mod.Deployment)
+    r = cli("deploy", "-f", manifest(cli.tmp, """
+vm: {name: bt-expired-single}
+placement: {cluster: DC0_C0, host: DC0_C0_H0, datastore: LocalDS_0}
+networks: [{portgroup: VM Network}]
+guest: {enabled: false}
+post_deploy: {power_on: false}
+"""), "--local", "ubuntu-test.ova", "--yes", "--trust-fingerprint", cli.fp)
+    assert "signed in again" in " ".join(r.output.split())
+    assert find_vm(si, "bt-expired-single") is not None
+
+    expire_after(batch_mod.BatchDeployment)
+    r = cli("deploy", "-f", manifest(cli.tmp, _three("bt-expired", 1)), "--local", "ubuntu-test.ova", "--yes",
+            "--trust-fingerprint", cli.fp, "--json")
+    doc = _batch_doc(r)
+    assert doc["exit_code"] == 0 and all(v["status"] == "deployed" for v in doc["vms"])
+    assert "signed in again" in " ".join(r.stderr.split())
+    for name in ("bt-expired-single", "bt-expired-1", "bt-expired-2", "bt-expired-3"):
+        wait_task(find_vm(si, name).Destroy_Task())
+
+
+def test_a_retry_reuses_the_first_runs_answers_and_destroy_takes_both_runs(cli, si, monkeypatch):
+    """Found in real testing: --retry-failed asked every question again, and a changed answer (hosts, VMs per
+    host, sizing) would silently have deployed different VMs. Now the results file keeps the answers (never a
+    password) and the retry reuses them: here with --yes and no answers in the manifest at all. `destroy --batch`
+    on the retry's file also deletes the first run's VMs."""
+    from vsphere_vm_deployment import deploy as deploy_mod
+    from vsphere_vm_deployment.errors import DeploymentError
+    from vsphere_vm_deployment.logsetup import _context
+
+    build_ova(cli.images / "ubuntu-test.ova")
+    m = manifest(cli.tmp, """
+resources: {cpu: 1, memory_gb: 1}
+networks: [{portgroup: VM Network}]
+guest: {enabled: false}
+post_deploy: {power_on: false, snapshot: false}
+""")
+    with monkeypatch.context() as first:  # not monkeypatch.undo(): it would drop the isolated config folders
+        _scripted_prompter(first, {
+            "Deploy to": [("host", "DC0_C0_H1"), ("host", "DC0_H0")],
+            "How many VMs?": "per_host", "VMs on each": 2,
+            "VM name pattern": "bt-rep-{host}-{i}",
+            "Datastores:": "auto",
+            "What next?": "deploy",
+        })
+        real = deploy_mod.reconfigure_spec
+
+        def reconfigure(vm, **k):
+            if getattr(_context, "label", None) == "bt-rep-DC0_H0-2":
+                raise DeploymentError("Reconfigure VM failed: test")
+            return real(vm, **k)
+        first.setattr(deploy_mod, "reconfigure_spec", reconfigure)
+        r = cli("deploy", "--batch", "-f", m, "--local", "ubuntu-test.ova", "--trust-fingerprint", cli.fp,
+                "--json", ok=False)
+    doc = _batch_doc(r)
+    assert r.exit_code == 4 and [v["status"] for v in doc["vms"]].count("failed") == 1
+    assert doc["answers"]["batch.name"] == "bt-rep-{host}-{i}" and doc["answers"]["batch.count"] == 2
+    assert doc["answers"]["batch.targets"] == [["host", "DC0_C0_H1"], ["host", "DC0_H0"]]
+
+    # Nothing but the results file: the manifest, the image and the answers are that run's.
+    r = cli("deploy", "--retry-failed", "latest", "--yes", "--trust-fingerprint", cli.fp, "--json")
+    again = _batch_doc(r)
+    out = " ".join(r.stderr.split())
+    assert "As that run: manifest" in out and "image --local" in out and "profile sim" in out, out
+    assert again["exit_code"] == 0 and [v["name"] for v in again["vms"]] == ["bt-rep-DC0_H0-2"], out
+    assert again["vms"][0]["host"] == "DC0_H0" and "(as in the first run)" in out
+    assert again["retry_of"] == str(Path(doc["results_file"]).resolve())
+
+    r = cli("destroy", "--batch", "latest", "--yes", "--trust-fingerprint", cli.fp)
+    out = " ".join(r.output.split())
+    assert "Also the run it retried" in out and "Deleted 4 of 4" in out, out
+    assert not [n for n in ("bt-rep-DC0_C0_H1-1", "bt-rep-DC0_C0_H1-2", "bt-rep-DC0_H0-1", "bt-rep-DC0_H0-2")
+                if find_vm(si, n)]

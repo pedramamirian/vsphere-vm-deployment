@@ -1,0 +1,32 @@
+# A batch: the same Ubuntu Server VM on several hosts, built in parallel.
+#   vmdeploy deploy -f examples/batch.yaml              (asks only what is missing, then shows the review)
+#   vmdeploy deploy -f examples/batch.yaml --yes --json (unattended; VMs that fail their checks are skipped)
+# The settings outside `batch:` are shared by every VM; `batch:` says where the VMs go and what differs.
+# See docs/manifest.md (Batch) and README (Deploying several VMs at once).
+profile: lab
+image: {preset: ubuntu-lts}
+placement: {folder: /Web}
+resources: {cpu: 2, memory_gb: 4, disk_gb: 40, disk_provisioning: thin}
+networks: [{portgroup: VM Network}]
+guest:
+  username: vmadmin
+  ssh_authorized_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIReplaceWithYourOwnPublicKey admin@example.test"]
+post_deploy: {power_on: true, wait_for_ip: true, snapshot: false}
+
+batch:
+  name: "web-{n:02}"              # web-01, web-02, ... ({host} and {i} number them per host instead)
+  hostname: "{name}"              # or a pattern, or `skip` to leave it to the image
+  targets:
+    - {host: esx-01.example.test, datastore: local-01}
+    - {host: esx-02.example.test, datastore: auto, count: 2}   # auto: the datastore with the most free space
+    - {hosts_matching: "esx-1*", datastore: auto}              # every host whose name matches
+  addresses:                      # or {mode: dhcp}; DHCP is also what you get without this section
+    mode: static
+    range: 192.0.2.50-192.0.2.69
+    prefix: 24
+    gateway: 192.0.2.1
+    dns: [192.0.2.53]
+  parallel: {vms: 4, uploads: 2, per_host: 2}
+  on_check_failure: skip          # --yes: skip VMs that fail their checks (cancel: deploy nothing)
+  on_failure: continue            # or stop: start no new VMs after a failure
+  keep_failed: false              # true: keep a VM that failed half-way, for troubleshooting

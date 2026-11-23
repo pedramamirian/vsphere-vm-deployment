@@ -58,7 +58,8 @@ virtual_machine:  # granted on the folder so it applies to the new VM
   - VirtualMachine.Config.Annotation
   - VirtualMachine.Config.Settings
   - VirtualMachine.Config.Resource         # lower an appliance's memory reservation when its memory is reduced
-  - VApp.ApplicationConfig                 # edit an imported OVA's properties (static address bound to NIC 1)
+  - VApp.ApplicationConfig                 # edit an imported OVA's properties (static address bound to NIC 1; the
+                                           #   network-config property that sets the DHCP client identifier)
   - VirtualMachine.Interact.PowerOn
   - VirtualMachine.Interact.PowerOff
   - VirtualMachine.Interact.ConsoleInteract

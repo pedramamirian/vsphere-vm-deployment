@@ -131,7 +131,7 @@ def ip_uses(conn) -> list[IpUse]:
     """IPv4 addresses reported by running VMs (VMware Tools) and by ESXi hosts' VMkernel adapters."""
     from pyVmomi import vim
 
-    from .inventory import collect
+    from .inventory import collect, display
 
     hosts = {}
     uses: list[IpUse] = []
@@ -155,10 +155,10 @@ def ip_uses(conn) -> list[IpUse]:
             for c in configs:
                 if c.ipAddress and ":" not in c.ipAddress:
                     seen.add(c.ipAddress)
-                    uses.append(IpUse(c.ipAddress, c.prefixLength, f"VM '{props.get('name')}'", nic.network, host))
+                    uses.append(IpUse(c.ipAddress, c.prefixLength, f"VM '{display(props.get('name'))}'", nic.network, host))
             for ip in nic.ipAddress or []:
                 if ":" not in ip and ip not in seen:
-                    uses.append(IpUse(ip, None, f"VM '{props.get('name')}'", nic.network, host))
+                    uses.append(IpUse(ip, None, f"VM '{display(props.get('name'))}'", nic.network, host))
     return uses
 
 

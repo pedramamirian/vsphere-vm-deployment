@@ -93,7 +93,7 @@ def _poll(monkeypatch, timeline, timeout=300):
     monkeypatch.setattr(d.time, "monotonic", clock.monotonic)
     monkeypatch.setattr(d.time, "sleep", clock.sleep)
     fake_self = NS(view=NS(update=lambda *a, **k: None), IP_SETTLE_S=d.Deployment.IP_SETTLE_S,
-                   _current_ipv4=d.Deployment._current_ipv4)
+                   IP_WAIT_HINT=d.Deployment.IP_WAIT_HINT, _current_ipv4=d.Deployment._current_ipv4)
     return d.Deployment._poll_ip(fake_self, _fake_vm(clock, timeline), timeout), clock.t
 
 
@@ -307,7 +307,8 @@ def test_appliance_settings_questions_by_type(monkeypatch):
         return f
 
     monkeypatch.setattr(d.console, "print", lambda *a, **k: printed.append(a[0]))
-    p = NS(interactive=True, section=lambda h: __import__("contextlib").nullcontext(), text=ask("text"),
+    p = NS(interactive=True, would_ask=lambda f: True, section=lambda h: __import__("contextlib").nullcontext(),
+           text=ask("text"),
            confirm=ask("confirm"), select=ask("select"), record=lambda label, val: recorded.append((label, val)))
     fake = NS(pkg=NS(info=NS(properties=props, has_cloud_init_properties=False)), m=NS(ovf=OvfSpec()), p=p)
     plan = NS()
@@ -318,6 +319,28 @@ def test_appliance_settings_questions_by_type(monkeypatch):
                         ("size", "s"), ("Flag to skip prechecks", "no")]
     assert plan.ovf_properties == {"hostname": "r1", "scp": "True", "vlan": "", "secret": "", "size": "s",
                                   "Flag to skip prechecks.": "False"}
+
+
+def test_a_password_the_image_refuses_is_not_shown_back(monkeypatch):
+    """Found in the security review: the hint for a manifest value the image refuses repeated the value, a
+    password's too."""
+    from types import SimpleNamespace as NS
+
+    from vsphere_vm_deployment import deploy as d
+    from vsphere_vm_deployment import logsetup
+    from vsphere_vm_deployment.errors import ConfigError
+    from vsphere_vm_deployment.manifest import OvfSpec
+    from vsphere_vm_deployment.ovf import OvfProperty
+
+    monkeypatch.setattr(logsetup, "_runtime_secrets", set())  # this test's values stay out of the others' logs
+    for key, password, hint in (("admin_password", True, None), ("site", False, "Given: 'east-01'.")):
+        pr = OvfProperty(key=key, type="string", default="", label=key, description="", user_configurable=True,
+                         password=password, qualifiers="MinLen(12)")
+        fake = NS(pkg=NS(info=NS(properties=[pr], has_cloud_init_properties=False)),
+                  m=NS(ovf=OvfSpec(properties={key: "east-01"})), p=NS(), batch_spec=None)
+        with pytest.raises(ConfigError) as e:
+            d.Deployment._ask_ovf_options(fake, NS())
+        assert e.value.hint == hint and "east-01" not in e.value.message
 
 
 def _eula_fake(monkeypatch, tmp_path, answers):

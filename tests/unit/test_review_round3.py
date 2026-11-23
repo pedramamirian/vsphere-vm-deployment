@@ -361,6 +361,8 @@ def test_a_folder_that_cannot_be_listed_does_not_start_a_copy_through_this_compu
     view = NS(skip=lambda *a: None, start=lambda *a: None, update=lambda *a, **k: None, done=lambda *a: None)
     fake = NS(plan=plan, view=view, conn=None, _copy_matches=None,
               _copy_through_pc_after=lambda e: pytest.fail("offered to copy through this computer"))
+    fake._stage_iso = lambda: d.Deployment._stage_iso(fake)
+    fake._create_iso_vm = lambda: pytest.fail("created a VM")
     with pytest.raises(isolib.FolderListError):
         d.Deployment._deploy_iso(fake)
     with pytest.raises(isolib.FolderListError):  # before reading the ISO through this computer
@@ -611,7 +613,7 @@ def test_ctrl_c_at_a_prompt_is_reported_once(monkeypatch):
         def unsafe_ask(self):
             raise KeyboardInterrupt
 
-    monkeypatch.setattr(ui.questionary, "confirm", lambda *a, **k: Interrupted())
+    monkeypatch.setattr(ui.questionary, "text", lambda *a, **k: Interrupted())
     p = ui.Prompter(interactive=False)
     p.interactive = True  # pytest has no terminal
     with pytest.raises(UserAborted, match="Cancelled by user"):
@@ -1034,6 +1036,8 @@ def test_a_copy_failing_its_full_check_falls_back_to_earlier_uploads_before_uplo
               iso_datastore_path="[shared] isos/x.iso")
     fake = NS(plan=plan, view=NS(skip=lambda *a, **k: None, start=start), _copy_is_genuine=lambda full: False,
               _upload_iso=lambda *a, **k: uploads.append(k))
+    fake._stage_iso = lambda: d.Deployment._stage_iso(fake)
+    fake._create_iso_vm = lambda: d.Deployment._create_iso_vm(fake)
     with pytest.raises(Stop):
         d.Deployment._deploy_iso(fake)
     assert uploads == [{}] and plan.iso_datastore_path is None and not plan.iso_found_on_datastore
@@ -1046,8 +1050,11 @@ def test_change_my_answers_does_not_carry_a_no_over_to_another_file(monkeypatch,
     from vsphere_vm_deployment import isolib, ui
 
     seen = []
-    monkeypatch.setattr(ui.questionary, "confirm", lambda q, default: NS(unsafe_ask=lambda: seen.append(default)
-                                                                         or default))
+    # the default is shown in the question, "(yes/no, suggested: yes)" or "(yes/no, before: no)"; answer with it
+    def text(q, validate):
+        default = q.endswith(": yes)")
+        return NS(unsafe_ask=lambda: seen.append(default) or ("yes" if default else "no"))
+    monkeypatch.setattr(ui.questionary, "text", text)
     iso = tmp_path / "x.iso"
     iso.write_bytes(b"x" * 10)
     a = isolib.DatastoreIso("dsA", "isos/x.iso", 10, {"h1"}, 1, "DC")
@@ -1671,3 +1678,21 @@ def test_one_rule_for_what_an_iso_is():
     assert isolib.is_iso_name("Win11.Iso") and isolib.is_iso_name("a.iso") and not isolib.is_iso_name("a.iso.txt")
     assert len(isolib.ISO_PATTERNS) == 8 and {"*.iso", "*.Iso", "*.ISO"} <= set(isolib.ISO_PATTERNS)
     assert isolib.find_isos.__defaults__[0] == isolib.ISO_PATTERNS
+
+
+def test_yes_no_questions_take_only_yes_or_no(monkeypatch):
+    """Found in real testing: questionary's confirm answered on the first y/n anywhere in stray typing, and Enter
+    took the default. Now only yes/y/no/n (any case) are accepted; anything else, even Enter alone, asks again."""
+    from vsphere_vm_deployment import ui
+
+    for good in ("yes", "Y", " no ", "N"):
+        assert ui.yes_no_error(good) is True
+    for bad in ("", "vmdeploy access audit", "yeah", "0"):
+        assert "Answer yes or no" in ui.yes_no_error(bad)
+    asked = []
+    monkeypatch.setattr(ui.questionary, "text", lambda q, validate: asked.append((q, validate)) or
+                        NS(unsafe_ask=lambda: "No"))
+    p = ui.Prompter(interactive=False)
+    p.interactive = True  # pytest has no terminal
+    assert p.confirm("Delete it?", default=True) is False
+    assert asked[0][0] == "Delete it? (yes/no, suggested: yes)" and asked[0][1] is ui.yes_no_error

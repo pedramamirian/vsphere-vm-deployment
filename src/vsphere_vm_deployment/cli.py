@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sys
 from collections import Counter
@@ -40,7 +41,7 @@ keyprovider_app = typer.Typer(no_args_is_help=True, help="vCenter key providers 
                                                          "e.g. Windows 11).")
 app.add_typer(keyprovider_app, name="keyprovider")
 
-_state = {"verbose": 0, "json": False}
+_state = {"verbose": 0, "json": False, "profile": None}
 
 ProfileOpt = Annotated[str | None, typer.Option("--profile", "-p", help="Connection profile to use.")]
 YesOpt = Annotated[bool, typer.Option("--yes", "-y", help="Non-interactive: take answers from the manifest/flags, "
@@ -59,16 +60,25 @@ def _version_cb(value: bool) -> None:
 def _main(verbose: Annotated[int, typer.Option("--verbose", "-v", count=True,
                                                help="-v shows each step's details, -vv adds API debug output.")] = 0,
           version: Annotated[bool, typer.Option("--version", help="Show the version and exit.", is_eager=True,
-                                                callback=_version_cb)] = False) -> None:
-    _state["verbose"] = verbose
+                                                callback=_version_cb)] = False,
+          profile: Annotated[str | None, typer.Option("--profile", "-p", hidden=True)] = None) -> None:
+    # Documented after the command (`vmdeploy doctor -p lab`), like every option; accepted before it too
+    # (`vmdeploy -p lab doctor`), unlisted, so that order is not an error.
+    _state["verbose"], _state["profile"] = verbose, profile
     setup_logging(verbose)
+    from .paths import log_dir_problem
+
+    problem = log_dir_problem()
+    if problem:
+        log.warning("%s", problem, extra=FILE_ONLY)
+        warn(problem)
     log.info("vsphere-vm-deployment %s, Python %s, args %s", __version__, sys.version.split()[0], sys.argv[1:])
 
 
 # ------------------------------------------------------------------------------------------------ helpers
 def _resolve_profile(name: str | None, prompter: Prompter, manifest_profile: str | None = None) -> Profile:
     store = ProfileStore()
-    name = name or manifest_profile or store.default_name()
+    name = name or _state["profile"] or manifest_profile or store.default_name()
     if name:
         return store.get(name)
     if not prompter.interactive:
@@ -201,9 +211,20 @@ def _run(fn):
     except typer.Exit:
         raise
     except Exception as e:  # noqa: BLE001
+        from pyVmomi import vim, vmodl
+
+        from .tasks import fault_message
+
         log.exception("Unexpected error")
-        error(f"Unexpected error: {e}", "This is probably a bug. Please open an issue and attach the log file "
-                                         "(secrets are removed from it automatically).")
+        bug = ("This is probably a bug. Please open an issue and attach the log file (secrets are removed from it "
+               "automatically).")
+        if isinstance(e, vim.fault.NotAuthenticated):
+            error(f"vSphere: {fault_message(e)}", "The session expired (vCenter and ESXi end idle sessions, after "
+                                                  "30 minutes by default). Run the command again.")
+        elif isinstance(e, vmodl.MethodFault):  # its text, not pyVmomi's dump of the whole fault object
+            error(f"Unexpected error from vSphere: {fault_message(e)}", bug)
+        else:
+            error(f"Unexpected error: {e}", bug)
         lf = current_log_file()
         if lf:
             console.print(f"[dim]Log: {lf}[/]")
@@ -239,13 +260,48 @@ def deploy(
     replace: Annotated[bool, typer.Option("--replace", help="Delete and re-create a VM with the same name.")] = False,
     trust_fingerprint: FingerprintOpt = None,
     json_out: Annotated[bool, typer.Option("--json", help="Print a JSON summary on stdout when done.")] = False,
+    batch: Annotated[bool, typer.Option("--batch", help="Deploy the same image to several hosts and datastores "
+                                                        "(a manifest with `batch:` implies it).",
+                                        rich_help_panel="Batch")] = False,
+    parallel: Annotated[int | None, typer.Option("--parallel", min=1, max=64, help="Batch: VMs built at the same "
+                                                 "time (default 4).", rich_help_panel="Batch")] = None,
+    parallel_uploads: Annotated[int | None, typer.Option("--parallel-uploads", min=1, max=32,
+                                                         help="Batch: uploads from this computer at the same time "
+                                                              "(default 2).", rich_help_panel="Batch")] = None,
+    per_host: Annotated[int | None, typer.Option("--per-host", min=1, max=64, help="Batch: VMs built on one host at "
+                                                 "the same time (default 2; at most 8 on vCenter).",
+                                                 rich_help_panel="Batch")] = None,
+    stop_on_failure: Annotated[bool, typer.Option("--stop-on-failure", help="Batch: start no new VMs after one "
+                                                  "fails (for troubleshooting).", rich_help_panel="Batch")] = False,
+    keep_failed: Annotated[bool, typer.Option("--keep-failed", help="Batch: keep a VM that failed half-way "
+                                              "instead of deleting it.", rich_help_panel="Batch")] = False,
+    retry_failed: Annotated[Path | None, typer.Option("--retry-failed", metavar="RESULTS.json|latest",
+                                                      help="Batch: deploy only the VMs a results file lists as "
+                                                           "failed, skipped or not started (`latest`: the newest "
+                                                           "in the log folder).",
+                                                      rich_help_panel="Batch")] = None,
 ) -> None:
-    """Deploy a VM: sign in, discover, pick the image, answer what is missing, review, deploy."""
+    """Deploy a VM, or a batch of them: sign in, discover, pick the image, answer what is missing, review, deploy.
+
+    A batch exits with 0 when every VM deployed, 4 when some did and some did not, and 1 when none did."""
     from .deploy import Deployment, DeployOptions
     from .manifest import load_manifest
     from .transfer import check_sha256
 
     def body():
+        # A retry needs nothing but its results file: the manifest, image, profile and batch options that run used
+        # are taken from it unless given again here (its answers are reused inside the batch).
+        retry_file = _results_files([retry_failed])[0] if retry_failed else None
+        first = _retry_settings(retry_file) if retry_file else {}
+        man = manifest or first.get("manifest")
+        if first.get("manifest_gone") and not manifest:
+            # its answers only hold what that run asked: what the manifest set is asked again (or missing, --yes)
+            gone = first["manifest_gone"]
+            if yes:
+                raise ConfigError(f"That run's manifest {gone} is not there any more.",
+                                  hint="Give it with -f, or run without --yes to answer what it set again.")
+            warn(f"That run's manifest {gone} is not there any more: what it set (names, targets, sizing, ...) is "
+                 "asked again; the answers that run was asked are reused.")
         sha = check_sha256(sha256)  # a typo is refused before anything is read or downloaded
         sources = [(flag, kind, v) for flag, kind, v in (
             ("--local", "local", local), ("--url", "url", url), ("--preset", "preset", preset),
@@ -256,16 +312,86 @@ def deploy(
             raise ConfigError(f"Use only one image source; given: {', '.join(f for f, _, _ in sources)}.",
                               hint="Choose one of --local, --pick-local, --url, --preset, --datastore-iso, "
                                    "--datastore-file.")
-        m = load_manifest(manifest)
+        m = load_manifest(man)
         kind, value = (sources[0][1], sources[0][2]) if sources else (None, None)
+        if kind is None and first.get("source"):
+            src = first["source"]
+            if not src.get("redacted"):
+                kind, value = src["kind"], src["value"]
+                sha = sha or src.get("sha256")
+            elif yes:  # interactive runs ask for the image again, as for a URL typed at the question
+                raise ConfigError("That run's image URL held a password or token, which results files never keep.",
+                                  hint="Give it again with --url (the image is checked against the first run's "
+                                       "SHA-256).")
+            else:
+                warn("That run's image URL held a password or token, which results files never keep: choose the "
+                     "image again (it is checked against the first run's SHA-256).")
+        batch_flags = {"--batch": batch, "--parallel": parallel, "--parallel-uploads": parallel_uploads,
+                       "--per-host": per_host, "--stop-on-failure": stop_on_failure, "--keep-failed": keep_failed,
+                       "--retry-failed": retry_failed}
+        is_batch = m.batch is not None or any(v not in (None, False) for v in batch_flags.values())
+        if is_batch and not batch and m.batch is None and not retry_failed:  # a retry is always a batch
+            used = ", ".join(k for k, v in batch_flags.items() if v not in (None, False))
+            raise ConfigError(f"{used} only work(s) for a batch.",
+                              hint="Add --batch (or a `batch:` section in the manifest).")
         p = Prompter(interactive=not yes)
-        prof = _resolve_profile(profile, p, m.profile)
-        result = Deployment(DeployOptions(profile=prof, manifest=m, image_kind=kind, image_value=value or None,
-                                          sha256=sha, interactive=not yes, replace=replace,
-                                          trust_fingerprints=trust_fingerprint or [])).run()
-        _print_result(result, json_out)
+        prof = _resolve_profile(profile or _state["profile"] or first.get("profile"), p, m.profile)
+        opts = DeployOptions(profile=prof, manifest=m, image_kind=kind, image_value=value or None, sha256=sha,
+                             interactive=not yes, replace=replace, trust_fingerprints=trust_fingerprint or [])
+        if not is_batch:
+            _print_result(Deployment(opts).run(), json_out)
+            return 0
+        from .batch import BatchDeployment, BatchOptions
 
-    _run(body)
+        o = first.get("options") or {}
+        doc = BatchDeployment(opts, BatchOptions(
+            parallel=parallel or o.get("parallel"), parallel_uploads=parallel_uploads or o.get("parallel_uploads"),
+            per_host=per_host or o.get("per_host"), stop_on_failure=stop_on_failure or bool(o.get("stop_on_failure")),
+            keep_failed=keep_failed or bool(o.get("keep_failed")), retry_file=retry_file,
+            manifest_path=str(Path(man).resolve()) if man else None)).run()
+        if json_out:
+            sys.stdout.write(json.dumps(doc, indent=2) + "\n")
+        return doc["exit_code"]
+
+    code = _run(body)
+    if code:
+        raise typer.Exit(code)
+
+
+def _retry_settings(path: Path) -> dict:
+    """What a batch's results file says about how it was run: its manifest (`manifest_gone` when it is not there
+    any more), image source, profile and batch options. Says what it takes; {} for a file without them (the batch
+    reads it again and reports a file it cannot read)."""
+    try:
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    out: dict = {}
+    taken: list[str] = []
+    man = doc.get("manifest")
+    if isinstance(man, str) and man:
+        if Path(man).is_file():
+            out["manifest"] = Path(man)
+            taken.append(f"manifest {man}")
+        else:
+            out["manifest_gone"] = man  # said (or refused with --yes) by deploy
+    src = doc.get("source")
+    if isinstance(src, dict) and src.get("kind"):
+        out["source"] = src
+        if not src.get("redacted"):  # a URL with a password or token: given again with --url
+            taken.append(f"image --{'datastore-file' if src['kind'] == 'datastore' else src['kind']} "
+                         f"{src.get('value')}")
+    if isinstance(doc.get("profile"), str):
+        out["profile"] = doc["profile"]
+        taken.append(f"profile {doc['profile']}")
+    if isinstance(doc.get("options"), dict):
+        out["options"] = doc["options"]
+    if taken:
+        console.print(Text("As that run: " + "; ".join(taken) + " (give them again here to change them).",
+                           style="dim"), soft_wrap=True)
+    return out
 
 
 def _print_result(result: dict, json_out: bool) -> None:
@@ -568,6 +694,24 @@ def _pick_many(p: Prompter, given: list[str] | None, question: str, choices: lis
     return p.checkbox(question, choices, field_name=flag)
 
 
+def _pick_covering(p: Prompter, given: list[str] | None, question: str, choices: list[tuple[str, str]], flag: str,
+                   hosts: set[str], hosts_of, what: str) -> list[str]:
+    """_pick_many, then a check that every chosen host can use one of the picks: a host left without a datastore
+    (or network) the account may use is one it cannot deploy to, which is easy to miss in a long list. Asked to
+    choose again, or to keep the choice; said as a warning when the answers were given."""
+    while True:
+        picked = _pick_many(p, given, question, choices, flag)
+        covered = set().union(*(set(hosts_of(n)) for n in picked)) if picked else set()
+        missing = sorted(hosts - covered)
+        if not missing:
+            return picked
+        shown = ", ".join(missing[:8]) + (f" and {len(missing) - 8} more" if len(missing) > 8 else "")
+        warn(f"No chosen {what} on {shown}: the account could not deploy VMs there.")
+        if given or not p.interactive or p.select(f"Choose the {what}s again?", [
+                (f"Choose the {what}s again", "again"), ("Keep this choice", "keep")], auto_single=False) == "keep":
+            return picked
+
+
 def _upn(user: str) -> str:
     """The sign-in name for a profile: user@domain, whichever form was typed."""
     if "\\" in user:
@@ -589,7 +733,8 @@ def access_setup(
                                                    "inside an existing folder; `access remove` deletes it when "
                                                    "empty.")]
     = None,
-    compute: Annotated[str | None, typer.Option(help="vCenter: cluster or standalone host to deploy to.")] = None,
+    compute: Annotated[list[str] | None, typer.Option(help="vCenter: cluster or standalone host to deploy to "
+                                                            "(repeat for several: a batch deploys to many).")] = None,
     datastore: Annotated[list[str] | None, typer.Option(help="vCenter: datastore the account may use "
                                                              "(repeat for more).")] = None,
     network: Annotated[list[str] | None, typer.Option(help="vCenter: network the account may use "
@@ -704,26 +849,34 @@ def access_setup(
                              "able to change, power off and delete them too. A dedicated, empty folder is safer.")
                     computes = [(f"Cluster {c}", c) for c in sorted(dc.clusters)] + \
                                [(f"Host {h}", h) for h, hi in sorted(dc.hosts.items()) if not hi.cluster]
-                    target = _pick(p, compute, "Cluster or host the account may deploy to:", computes, "--compute")
-                    # The cluster, or the standalone host's compute resource, granted without propagation (see
+                    targets = _pick_many(p, compute, "Clusters or hosts the account may deploy to (several for "
+                                                     "batches):", computes, "--compute")
+                    # Each cluster, or standalone host's compute resource, granted without propagation (see
                     # access.py). Not the root resource pool: vCenter refuses permissions on that sub-entity.
-                    if target in dc.clusters:
-                        hosts, obj = set(dc.clusters[target].hosts), dc.clusters[target].obj
-                        label = f"Cluster {target}"
-                    else:
-                        hosts, obj, label = {target}, dc.hosts[target].obj.parent, f"Host {target}"
+                    hosts: set[str] = set()
+                    placement: list[tuple[str, object]] = []
+                    for target in targets:
+                        if target in dc.clusters:
+                            hosts |= set(dc.clusters[target].hosts)
+                            placement.append((f"Cluster {target}", dc.clusters[target].obj))
+                        else:
+                            hosts.add(target)
+                            placement.append((f"Host {target}", dc.hosts[target].obj.parent))
                     total = len(dc.hosts)
-                    ds_names = _pick_many(p, datastore, "Datastores the account may use:",
-                                          [(d.host_label(total), d.name) for d in dc.datastores_for(hosts) if d.usable],
-                                          "--datastore")
-                    net_names = _pick_many(p, network, "Networks the account may connect VMs to:",
-                                           [(n.label(), n.name) for n in dc.usable_networks(hosts)], "--network")
+                    ds_names = _pick_covering(
+                        p, datastore, "Datastores the account may use:",
+                        [(d.host_label(total), d.name) for d in dc.datastores_for(hosts) if d.usable], "--datastore",
+                        hosts, lambda n: dc.datastores[n].hosts, "datastore")
+                    net_names = _pick_covering(
+                        p, network, "Networks the account may connect VMs to:",
+                        [(n.label(), n.name) for n in dc.usable_networks(hosts)], "--network",
+                        hosts, lambda n: dc.networks[n].hosts or hosts, "network")
                     image_names, browse_names = _ask_image_datastores(p, conn, dc, ds_names, image_datastore)
                 plan = access.build_vcenter_plan(
                     conn, principal=principal, role_name=role_name,
                     folder=(folder_path, None if create_name else dc.folders[folder_path]),
                     new_folder=(dc.folders[create_parent], create_name) if create_name else None,
-                    compute=(label, obj), datastores=[(n, dc.datastores[n].obj) for n in ds_names],
+                    compute=placement, datastores=[(n, dc.datastores[n].obj) for n in ds_names],
                     networks=[(n, dc.networks[n].obj) for n in net_names],
                     image_datastores=[(n, dc.datastores[n].obj) for n in image_names],
                     browse_datastores=[(n, dc.datastores[n].obj) for n in browse_names])
@@ -1407,17 +1560,51 @@ def list_vms(profile: ProfileOpt = None, yes: YesOpt = False, trust_fingerprint:
 
 
 @app.command()
-def destroy(name: str, profile: ProfileOpt = None, yes: YesOpt = False, trust_fingerprint: FingerprintOpt = None,
+def destroy(name: Annotated[str | None, typer.Argument(help="The VM to delete (or use --batch).")] = None,
+            profile: ProfileOpt = None, yes: YesOpt = False, trust_fingerprint: FingerprintOpt = None,
             datacenter: Annotated[str | None, typer.Option(help="Datacenter that holds the VM.")] = None,
             force: Annotated[bool, typer.Option("--force", help="Allow deleting VMs not created by this tool.")] = False,
             delete_iso: Annotated[bool | None, typer.Option(
                 "--delete-iso/--keep-iso", help="Also delete the ISO copy (vmdeploy-iso/) the VM used, if no other VM "
-                                                "uses it. Default: ask (keep with --yes).")] = None) -> None:
-    """Power off and permanently delete a VM (only VMs this tool deployed, unless --force)."""
+                                                "uses it. Default: ask (keep with --yes).")] = None,
+            batch: Annotated[list[Path] | None, typer.Option(
+                "--batch", metavar="RESULTS.json|latest",
+                help="Delete the VMs a batch deployed, from its results file (repeat for a batch and its "
+                     "retries; `latest`: the newest in the log folder): one sign-in, one list, one confirmation. "
+                     "Only VMs this tool deployed.")] = None
+            ) -> None:
+    """Power off and permanently delete a VM, or every VM of a batch (only VMs this tool deployed, unless --force)."""
     from .deploy import Deployment  # noqa: F401 - shared helpers
     from .inventory import find_vm_with
 
+    def check_arguments() -> None:
+        if batch and (name or datacenter or force):
+            raise ConfigError("--batch takes the VMs from the results file: leave out the VM name, --datacenter and "
+                              "--force.")
+        if not batch and not name:
+            raise ConfigError("Name the VM to delete, or use --batch RESULTS.json.",
+                              hint="`vmdeploy list` shows the VMs vmdeploy deployed; `vmdeploy destroy --batch latest` "
+                                   "deletes the newest batch's VMs (`vmdeploy logs` lists the batches).")
+
+    def batch_body() -> int:
+        from .batch import destroy_batch
+
+        check_arguments()
+        files = _results_files(batch)  # before signing in: a missing file is refused straight away
+        conn, p = _connect(profile, yes, trust_fingerprint)
+        with conn:
+            code, used_isos = destroy_batch(conn, p, files)
+            _offer_iso_cleanup(conn, p, used_isos, delete_iso)
+        return code
+
+    if batch:
+        code = _run(batch_body)
+        if code:
+            raise typer.Exit(code)
+        return
+
     def body():
+        check_arguments()
         conn, p = _connect(profile, yes, trust_fingerprint)
         with conn:
             root = None
@@ -1629,6 +1816,146 @@ def images_clear() -> None:
 
     n, size = clear_cache()
     console.print(f"Removed {n} cached image(s), {size / 2**30:.1f} GB freed.")
+
+
+# ------------------------------------------------------------------------------------------------ logs
+def _results_files(values: list[Path]) -> list[Path]:
+    """Results files from the command line, with `latest` and bare file names looked up in the log folder; says
+    which file `latest` picked, since its name is not in front of the user."""
+    from .logfiles import LATEST, results_file
+
+    out = []
+    for v in values:
+        f = results_file(v)
+        if not f.is_file():  # refused here, before signing in
+            raise ConfigError(f"No results file {v}.", hint="`vmdeploy logs` lists the batch results files: give a "
+                                                            "path, a file name from the log folder, or `latest`.")
+        if str(v).lower() == LATEST and f != v:
+            console.print(Text("Newest results file: ", style="dim") + Text(str(f)), soft_wrap=True)
+        out.append(f)
+    return out
+
+
+@app.command()
+def logs(folder: Annotated[str | None, typer.Option(
+             "--folder", metavar="PATH|default",
+             help="Keep logs and batch results files in this folder from now on, e.g. a synced (OneDrive) or "
+                  "network folder that outlasts a logoff and is reachable from other computers, and that only "
+                  "you can write to. `default` goes back to the standard folder.")] = None,
+         count: Annotated[int, typer.Option("--count", "-n", min=1, help="How many of each to list.")] = 10) -> None:
+    """Show where logs and batch results files are kept and list the recent ones, or choose the folder."""
+    def body():
+        if folder is not None:
+            _set_log_folder(folder)
+        else:
+            _show_logs(count)
+    _run(body)
+
+
+def _set_log_folder(value: str) -> None:
+    import tempfile
+
+    from . import paths
+    from .logfiles import inside_git_repository
+
+    old = paths.log_dir()
+    settings = paths.read_settings()
+    if value.strip().lower() == "default":
+        settings.pop("log_folder", None)
+        paths.write_settings(settings)
+        new = paths.default_log_dir()
+        console.print(Text("Logs and batch results files go to the standard folder again: ") + Text(str(new)),
+                      soft_wrap=True)
+    else:
+        new = Path(value).expanduser().absolute()
+        try:
+            new.mkdir(parents=True, exist_ok=True)
+            # A new file with a name of its own, created exclusively: a file or link already in the folder (one
+            # others can write to) is never opened, so nothing it points to is written to.
+            fd, probe = tempfile.mkstemp(prefix=".vmdeploy-write-test-", dir=new)
+            os.close(fd)
+            os.unlink(probe)
+        except OSError as e:
+            raise ConfigError(f"Cannot use {new} for logs: {e.strerror or e}.",
+                              hint="Choose a folder you can create files in.") from None
+        settings["log_folder"] = str(new)
+        paths.write_settings(settings)
+        console.print(Text("From now on, logs and batch results files go to: ") + Text(str(new), style="bold"),
+                      soft_wrap=True)
+        console.print(Text("Keep it a folder only you can write to: a results file in it decides what "
+                           "`deploy --retry-failed` deploys and what `destroy --batch` deletes.", style="dim"),
+                      soft_wrap=True)
+        repo = inside_git_repository(new)
+        if repo:
+            warn(f"This folder is inside a Git repository ({repo}). Logs and results files name your vCenter, "
+                 "hosts, VMs and addresses (never passwords): make sure Git ignores the folder (.gitignore), so "
+                 "they are never committed or published.")
+    if os.environ.get("VMDEPLOY_LOG_DIR"):
+        warn(f"VMDEPLOY_LOG_DIR is set ({os.environ['VMDEPLOY_LOG_DIR']}) and comes first: remove it to use "
+             "this folder.")
+    try:
+        moved_away = old.resolve() != new.resolve() and any(old.iterdir())
+    except OSError:
+        moved_away = False
+    if moved_away:
+        console.print(Text(f"Files already in {old} stay there; copy them over to see them in `vmdeploy logs`.",
+                           style="dim"), soft_wrap=True)
+    console.print("[dim]This setting is kept on this computer, for your user: set it once on each computer.[/]")
+
+
+def _show_logs(count: int) -> None:
+    from . import isolib, paths
+    from .logfiles import batch_files, log_files, read_batch, stamp_of
+
+    folder = paths.log_dir()
+    source = {"env": "set by VMDEPLOY_LOG_DIR", "setting": "chosen with vmdeploy logs --folder",
+              "default": "the standard folder"}[paths.log_dir_source()]
+    console.print(Text("Log folder: ", style="bold") + Text(str(folder)) + Text(f"  ({source})", style="dim"),
+                  soft_wrap=True)
+
+    batches = batch_files()
+    if batches:
+        t = Table(title=f"Batch results, newest first ({min(count, len(batches))} of {len(batches)})",
+                  title_justify="left", title_style="bold")
+        for col in ("Started", "Datacenter", "Image", "Deployed", "File"):
+            t.add_column(col, overflow="fold")
+        for f in batches[:count]:
+            b = read_batch(f)
+            when = b.started.strftime("%Y-%m-%d %H:%M") if b.started else "?"
+            if not b.readable:
+                t.add_row(when, "", "", "[red]cannot be read[/]", esc(f.name))
+                continue
+            style = "green" if b.deployed == b.total else ("yellow" if b.deployed else "red")
+            result = f"{b.deployed} of {b.total}" + (f" ({b.problems} with problems)" if b.problems else "")
+            # a local or datastore image by its file name: its full path made the table too wide to read
+            t.add_row(when, esc(b.datacenter), esc(isolib.file_name(b.image) if b.image else ""),
+                      f"[{style}]{result}[/]", esc(f.name))
+        console.print(t)
+    else:
+        console.print("No batch results files yet.")
+
+    current = current_log_file()
+    logfiles = [f for f in log_files() if f != current]  # not this command's own, just started
+    if logfiles:
+        t = Table(title=f"Log files, newest first ({min(count, len(logfiles))} of {len(logfiles)})",
+                  title_justify="left", title_style="bold")
+        for col in ("Date", "File", "Size"):
+            t.add_column(col, overflow="fold")
+        for f in logfiles[:count]:
+            when = stamp_of(f)
+            try:
+                size = f"{max(1, round(f.stat().st_size / 1024))} KB"
+            except OSError:
+                size = "?"
+            t.add_row(when.strftime("%Y-%m-%d %H:%M:%S") if when else "?", esc(f.name), size)
+        console.print(t)
+
+    if batches:
+        console.print("[dim]Use a results file by its name or `latest`, e.g. vmdeploy destroy --batch latest, "
+                      "or vmdeploy deploy --retry-failed latest.[/]")
+    if paths.log_dir_source() == "default":
+        console.print("[dim]To keep them somewhere that outlasts a logoff or is reachable from other computers: "
+                      "vmdeploy logs --folder PATH[/]")
 
 
 def main() -> None:

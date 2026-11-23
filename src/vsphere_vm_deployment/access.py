@@ -183,20 +183,23 @@ def folder_name_error(name: str, taken: set[str]) -> str | None:
 
 
 def build_vcenter_plan(conn: Connection, *, principal: str, role_name: str, folder: tuple[str, object],
-                       compute: tuple[str, object], datastores: list[tuple[str, object]],
+                       compute: tuple[str, object] | list[tuple[str, object]],
+                       datastores: list[tuple[str, object]],
                        networks: list[tuple[str, object]], new_folder: tuple[object, str] | None = None,
                        image_datastores: list[tuple[str, object]] | None = None,
                        browse_datastores: list[tuple[str, object]] | None = None) -> AccessPlan:
     """folder/compute/datastores/networks are (label, managed object) pairs chosen by the administrator.
     `compute` is the cluster, or the standalone host's ComputeResource (never its root resource pool: vCenter
-    rejects permissions on that sub-entity with "Operation not allowed on sub-entity: Resources").
+    rejects permissions on that sub-entity with "Operation not allowed on sub-entity: Resources"), or a list of
+    them: a batch deploys to several hosts or clusters.
     With `new_folder` (parent, name) the folder is created by apply(); its grant has no entity until then."""
     role_name = validate_role_name(role_name)
     read_role = role_name + READ_SUFFIX
     grants = [Grant(conn.content.rootFolder, "Top of the inventory (read-only, to discover it)", read_role, True),
               Grant(None, f"New VM folder {folder[0]} (created by vmdeploy)", role_name, True) if new_folder
-              else Grant(folder[1], f"VM folder {folder[0]}", role_name, True),
-              Grant(compute[1], f"{compute[0]} (placement only)", role_name, False)]
+              else Grant(folder[1], f"VM folder {folder[0]}", role_name, True)]
+    grants += [Grant(obj, f"{label} (placement only)", role_name, False)
+               for label, obj in ([compute] if isinstance(compute, tuple) else compute)]
     from .inventory import display  # vCenter's %2f etc. shown as typed
 
     grants += [Grant(obj, f"Datastore {display(name)}", role_name, False) for name, obj in datastores]
